@@ -10,7 +10,6 @@ void FSM_Init(FSM_State_t *fsm)
 
 FlightPhase_t FSM_Update(FSM_State_t *fsm,
                          float a_net_ms2,
-                         float velocity,
                          bool  apogee_vote,
                          uint32_t now_ms)
 {
@@ -57,6 +56,19 @@ FlightPhase_t FSM_Update(FSM_State_t *fsm,
 
     /* ------------------------------------------------------------------ */
     case PHASE_COAST:
+        /*
+         * Chuff recovery: if thrust-level acceleration reappears, the motor
+         * is still burning (false burnout from a pressure oscillation that
+         * lasted longer than BURNOUT_DEBOUNCE_MS).  Revert to BOOST so that
+         * the apogee detector stays gated off and burnout re-detection can
+         * proceed cleanly.
+         */
+        if (a_net_ms2 >= LAUNCH_ACCEL_THRESH) {
+            fsm->phase          = PHASE_BOOST;
+            fsm->phase_entry_ms = now_ms;
+            fsm->burnout_debounce_active = false;
+            break;
+        }
         if (apogee_vote) {
             fsm->phase          = PHASE_APOGEE;
             fsm->phase_entry_ms = now_ms;
@@ -80,8 +92,6 @@ FlightPhase_t FSM_Update(FSM_State_t *fsm,
     default:
         break;
     }
-
-    (void)velocity;  /* available for future descend-phase logic */
 
     return fsm->phase;
 }

@@ -31,7 +31,16 @@
  */
 typedef struct {
     int8_t   consec_count;        /* C1: consecutive sub-threshold sample count */
-    bool     apogee_fired;        /* latched true once apogee is declared */
+    /*
+     * apogee_fired is written by APOGEE_Update() (called from an ISR-triggered
+     * processing function) and read by APOGEE_Vote() in the main loop.
+     * volatile ensures the compiler re-reads from memory on every access and
+     * does not cache the value in a register across the ISR boundary.
+     * The latch pattern (write once: false → true, never cleared) is safe
+     * under concurrent access without a mutex — the worst case is a one-sample
+     * delayed read, which adds at most 4.81 ms to detection latency.
+     */
+    volatile bool apogee_fired;   /* latched true once apogee is declared */
     bool     imu_failed;          /* watchdog: set when IMU silent > IMU_WATCHDOG_MS */
     uint32_t coast_start_ms;      /* timestamp when COAST phase entered */
     uint32_t sustained_entry_ms;  /* C3: timestamp when sustained-drop window opened */

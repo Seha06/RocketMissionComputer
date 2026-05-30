@@ -41,7 +41,7 @@ void DR_Init(DR_State_t *dr, float dt_s);
  * Must be called while the rocket is stationary on the launch pad.
  */
 void DR_CalibrateBias(DR_State_t *dr,
-                      const float *a_vertical, uint16_t n);
+                      const float *a_vertical, uint32_t n);
 
 /*
  * Predict step — call at every IMU sample.

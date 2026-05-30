@@ -147,9 +147,7 @@ static int run_trial(unsigned seed, float bias)
 
         /* Flight FSM */
         FlightPhase_t prev  = fsm.phase;
-        FlightPhase_t phase = FSM_Update(&fsm, a_net_est,
-                                          DR_GetVelocityRaw(&dr),
-                                          false, t_ms);
+        FlightPhase_t phase = FSM_Update(&fsm, a_net_est, false, t_ms);
 
         if (prev != PHASE_COAST && phase == PHASE_COAST)
             APOGEE_OnCoastEntry(&apg, t_ms);
@@ -178,6 +176,155 @@ static int run_trial(unsigned seed, float bias)
         return (int)0x80000000;  /* INT32_MIN: not detected */
 
     return (int)((int32_t)apogee_det_ms - (int32_t)apogee_true_ms);
+}
+
+/* ------------------------------------------------------------------
+ * run_trial_with_pitch: same as run_trial but with a constant pitch
+ * offset.  The IMU body-axis acceleration is projected by cos(pitch),
+ * and the lateral component ax is set to a_specific * sin(pitch) so
+ * that the attitude filter sees a realistic tilt vector.
+ * ------------------------------------------------------------------ */
+static int run_trial_with_pitch(unsigned seed, float bias, float pitch_deg)
+{
+    srand(seed);
+
+    const float dt    = IMU_A_DT_S;
+    const float NOISE = 0.05f;
+    const float pitch_rad = pitch_deg * 0.017453293f;
+    const float cos_p = cosf(pitch_rad);
+    const float sin_p = sinf(pitch_rad);
+
+    DR_State_t       dr;
+    ApogeeDetector_t apg;
+    FSM_State_t      fsm;
+    Attitude_t       att;
+
+    DR_Init(&dr, dt);
+    APOGEE_Init(&apg);
+    FSM_Init(&fsm);
+    ATT_Init(&att);
+
+    /* Calibration with tilt: specific force on body-z = g * cos(pitch) */
+    float calib[CALIB_SAMPLE_COUNT];
+    for (int i = 0; i < CALIB_SAMPLE_COUNT; i++)
+        calib[i] = GRAVITY_MS2 * cos_p + bias + randn(NOISE);
+    DR_CalibrateBias(&dr, calib, CALIB_SAMPLE_COUNT);
+
+    float true_v   = 0.0f;
+    float true_alt = 0.0f;
+    uint32_t t_ms  = 0;
+    uint32_t apogee_true_ms = 0;
+    uint32_t apogee_det_ms  = 0;
+    bool     apogee_det     = false;
+
+    const int MAX_STEPS = (int)(40.0f / dt);
+
+    for (int step = 0; step < MAX_STEPS; step++) {
+        float t_s = (float)step * dt;
+        float m   = (t_s < MOTOR_BURN_S)
+                    ? ROCKET_TOTAL_KG - (MOTOR_PROP_KG / MOTOR_BURN_S) * t_s
+                    : ROCKET_DRY_KG;
+
+        float a_drag     = -(DRAG_K * true_v * fabsf(true_v)) / m;
+        float a_thrust_s = (t_s < MOTOR_BURN_S) ? (MOTOR_THRUST_N / m) : 0.0f;
+        float a_specific = a_thrust_s + a_drag;
+        float a_inertial = a_specific - GRAVITY_MS2;
+
+        true_v   += a_inertial * dt;
+        true_alt += true_v * dt;
+
+        if (step > 0 && true_v <= 0.0f && apogee_true_ms == 0u)
+            apogee_true_ms = t_ms;
+
+        /* Body-frame acceleration: a_body_z = a_specific * cos_p,
+         * a_body_x = a_specific * sin_p (lateral from tilt) */
+        float a_body_z = a_specific * cos_p + bias + randn(NOISE);
+        float a_body_x = a_specific * sin_p + randn(0.01f);
+        float a_arr[3] = {a_body_x, 0.0f, a_body_z};
+
+        ATT_Update(&att, a_arr, 0.0f, dt);
+        float pitch = ATT_GetPitchRad(&att);
+
+        DR_Predict(&dr, a_body_z, pitch, dt);
+
+        float a_net_est = a_body_z * cosf(pitch) - GRAVITY_MS2 - dr.x[2];
+
+        FlightPhase_t prev  = fsm.phase;
+        FlightPhase_t phase = FSM_Update(&fsm, a_net_est, false, t_ms);
+
+        if (prev != PHASE_COAST && phase == PHASE_COAST)
+            APOGEE_OnCoastEntry(&apg, t_ms);
+
+        if (phase == PHASE_COAST && !apogee_det) {
+            if (APOGEE_Update(&apg, DR_GetVelocityRaw(&dr), phase, t_ms)) {
+                apogee_det    = true;
+                apogee_det_ms = t_ms;
+            }
+        }
+
+        if (apogee_det && (t_ms - apogee_det_ms) > 2000u) break;
+
+        t_ms = (uint32_t)((float)(step + 1) * 1000.0f / IMU_A_ODR_HZ + 0.5f);
+    }
+
+    if (!apogee_det || apogee_true_ms == 0)
+        return (int)0x80000000;
+
+    return (int)((int32_t)apogee_det_ms - (int32_t)apogee_true_ms);
+}
+
+/* ------------------------------------------------------------------
+ * C2 safety timer test: verify that APOGEE_Update fires C2 after
+ * APOGEE_COAST_MAX_MS even when velocity stays strongly positive
+ * (simulating both IMUs reporting bad data that keeps v > 0).
+ * ------------------------------------------------------------------ */
+static int test_c2_timer(void)
+{
+    int pass = 0, fail = 0;
+
+    ApogeeDetector_t det;
+    APOGEE_Init(&det);
+
+    const uint32_t coast_start = 5000u;
+    APOGEE_OnCoastEntry(&det, coast_start);
+
+    /* Tick with strongly positive velocity — C1 and C3 must not fire */
+    const float far_positive_v = 100.0f;
+    const uint32_t step_ms = 10u;
+    uint32_t t = coast_start + APOGEE_COAST_MIN_MS;
+    bool fired = false;
+
+    while (t <= coast_start + APOGEE_COAST_MAX_MS + 1000u) {
+        if (!fired)
+            fired = APOGEE_Update(&det, far_positive_v, PHASE_COAST, t);
+        t += step_ms;
+    }
+
+    if (fired && det.apogee_fired) {
+        pass++;
+    } else {
+        printf("  FAIL [C2 timer]: did not fire after %u ms coast\n",
+               APOGEE_COAST_MAX_MS);
+        fail++;
+    }
+
+    /* Verify C2 fired at the right time (not before COAST_MAX) */
+    {
+        ApogeeDetector_t det2;
+        APOGEE_Init(&det2);
+        APOGEE_OnCoastEntry(&det2, coast_start);
+
+        uint32_t pre_c2 = coast_start + APOGEE_COAST_MAX_MS - step_ms;
+        bool pre_fired = APOGEE_Update(&det2, far_positive_v, PHASE_COAST, pre_c2);
+        if (!pre_fired) {
+            pass++;
+        } else {
+            printf("  FAIL [C2 timer]: fired %u ms too early\n", step_ms);
+            fail++;
+        }
+    }
+
+    return fail;
 }
 
 int main(void)
@@ -352,5 +499,71 @@ int main(void)
         return 1;
     }
     printf("PASS: dual-IMU voting all correct\n");
+
+    /* ------------------------------------------------------------------
+     * C2 Safety Timer Tests
+     * Verifies that C2 fires after APOGEE_COAST_MAX_MS even when velocity
+     * stays strongly positive (C1 and C3 never trigger).
+     * ------------------------------------------------------------------ */
+    printf("\n=== C2 Safety Timer Tests ===\n");
+    {
+        int c2_fail = test_c2_timer();
+        if (c2_fail > 0) {
+            printf("FAIL: C2 timer test failed (%d error(s))\n", c2_fail);
+            return 1;
+        }
+        printf("PASS: C2 safety timer fires correctly\n");
+    }
+
+    /* ------------------------------------------------------------------
+     * Pitch Deviation Tests (0°, 5°, 10°, 15°)
+     * Verifies that the complementary filter + cosine projection keep
+     * detection delay within 100 ms even when the rocket tilts during boost.
+     * ------------------------------------------------------------------ */
+    printf("\n=== Pitch Deviation Tests ===\n");
+    {
+        const float pitch_angles[] = {0.0f, 5.0f, 10.0f, 15.0f};
+        const int   N_ANGLES = 4;
+        const int   N_TRIALS = 50;
+        int pitch_overall_fail = 0;
+
+        for (int ai = 0; ai < N_ANGLES; ai++) {
+            float pitch_deg = pitch_angles[ai];
+            int p_pass = 0, p_fail = 0;
+            int p_min = 9999, p_max = -9999;
+
+            for (int ti = 0; ti < N_TRIALS; ti++) {
+                /* Mix seed to avoid correlated LCG states across angles */
+                unsigned seed = (unsigned)(ti * 0x9e3779b9u) ^ (unsigned)(ai * 0x517CC1B7u);
+                float bias = -0.20f + 0.40f * ((float)ti / (float)(N_TRIALS - 1));
+
+                int d = run_trial_with_pitch(seed, bias, pitch_deg);
+
+                if (d == (int)0x80000000) {
+                    p_fail++;
+                    continue;
+                }
+
+                if (d < p_min) p_min = d;
+                if (d > p_max) p_max = d;
+
+                if (d >= -20 && d <= 100) p_pass++;
+                else                      p_fail++;
+            }
+
+            printf("  pitch=%5.1f°  pass=%d/%d  delay=[%d, %d] ms  %s\n",
+                   pitch_deg, p_pass, N_TRIALS, p_min, p_max,
+                   (p_fail == 0) ? "PASS" : "FAIL ***");
+
+            if (p_fail > 0) pitch_overall_fail += p_fail;
+        }
+
+        if (pitch_overall_fail > 0) {
+            printf("FAIL: %d pitch trial(s) outside window\n", pitch_overall_fail);
+            return 1;
+        }
+        printf("PASS: all pitch deviation trials within 100 ms window\n");
+    }
+
     return 0;
 }

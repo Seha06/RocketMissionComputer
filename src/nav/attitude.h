@@ -17,6 +17,14 @@ typedef struct {
 void ATT_Init(Attitude_t *att);
 
 /*
+ * Calibrate gyro pitch-axis bias from static samples collected on the pad.
+ * Must be called while the rocket is motionless, before launch.
+ * Removes systematic offset that would otherwise integrate over the 4.2 s
+ * boost phase and produce a persistent pitch error (~4°) at burnout.
+ */
+void ATT_CalibrateGyroBias(Attitude_t *att, float bias_rad_s);
+
+/*
  * att  : attitude state
  * a    : [ax, ay, az] m/s² body frame
  * gyro : pitch-axis gyro rate (rad/s)

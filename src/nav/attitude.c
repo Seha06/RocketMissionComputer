@@ -18,6 +18,11 @@ void ATT_Init(Attitude_t *att)
     att->initialised = true;
 }
 
+void ATT_CalibrateGyroBias(Attitude_t *att, float bias_rad_s)
+{
+    att->gyro_bias_rad_s = bias_rad_s;
+}
+
 void ATT_Update(Attitude_t *att,
                 const float a[3], float gyro_pitch, float dt)
 {

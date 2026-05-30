@@ -6,7 +6,7 @@
 /* -------------------------------------------------------------------------
  * Helper: 3×3 matrix multiply C = A * B
  * ------------------------------------------------------------------------- */
-static void mat3_mul(const float A[3][3], const float B[3][3], float C[3][3])
+static inline void mat3_mul(const float A[3][3], const float B[3][3], float C[3][3])
 {
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
@@ -19,8 +19,8 @@ static void mat3_mul(const float A[3][3], const float B[3][3], float C[3][3])
 }
 
 /* C = A * B^T */
-static void mat3_mul_bt(const float A[3][3], const float B[3][3],
-                        float C[3][3])
+static inline void mat3_mul_bt(const float A[3][3], const float B[3][3],
+                               float C[3][3])
 {
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
@@ -33,7 +33,7 @@ static void mat3_mul_bt(const float A[3][3], const float B[3][3],
 }
 
 /* C = A + B */
-static void mat3_add(const float A[3][3], const float B[3][3], float C[3][3])
+static inline void mat3_add(const float A[3][3], const float B[3][3], float C[3][3])
 {
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
@@ -41,7 +41,7 @@ static void mat3_add(const float A[3][3], const float B[3][3], float C[3][3])
 }
 
 /* Enforce P symmetry to counteract floating-point rounding */
-static void mat3_symmetrise(float P[3][3])
+static inline void mat3_symmetrise(float P[3][3])
 {
     for (int i = 0; i < 3; i++)
         for (int j = i + 1; j < 3; j++)
@@ -70,12 +70,12 @@ void DR_Init(DR_State_t *dr, float dt_s)
 }
 
 void DR_CalibrateBias(DR_State_t *dr,
-                      const float *a_vertical, uint16_t n)
+                      const float *a_vertical, uint32_t n)
 {
-    if (n == 0) return;
+    if (n == 0u) return;
 
     double sum = 0.0;
-    for (uint16_t i = 0; i < n; i++)
+    for (uint32_t i = 0u; i < n; i++)
         sum += (double)a_vertical[i];
 
     float mean = (float)(sum / (double)n);

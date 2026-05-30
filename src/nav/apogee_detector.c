@@ -39,7 +39,13 @@ bool APOGEE_Update(ApogeeDetector_t *det,
     if (velocity < APOGEE_VEL_THRESHOLD) {
         if (det->consec_count < 127) det->consec_count++;
     } else {
-        det->consec_count = 0;
+        /*
+         * Decrement rather than zero-reset: a single noise spike above the
+         * threshold does not erase all prior evidence of a negative-velocity
+         * trend.  This makes C1 robust to isolated upward noise transients
+         * while still requiring a genuinely sustained negative velocity to fire.
+         */
+        if (det->consec_count > 0) det->consec_count--;
     }
     bool c1 = (det->consec_count >= APOGEE_N_CONSEC);
 

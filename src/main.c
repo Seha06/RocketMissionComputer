@@ -52,7 +52,23 @@ static void platform_i2c_read(uint8_t addr, uint8_t reg,
     (void)addr; (void)reg; (void)data; (void)len;
 }
 
-static uint32_t platform_tick_ms(void)        { return 0; /* HAL_GetTick(); */ }
+static uint32_t platform_tick_ms(void)
+{
+#if defined(PRODUCTION_BUILD)
+    /* HAL_GetTick(); */
+#error "platform_tick_ms(): replace stub with HAL_GetTick() before production build"
+#elif defined(ROCKET_SIMULATION_BUILD)
+    /* Monotonically increasing simulation tick.
+     * Advances by 5 ms per call — close to the 4.81 ms IMU-A sample period
+     * so that all time-based guards (COAST_MIN, C2 timer, pyro pulse) see
+     * realistic elapsed times in unit/integration tests that call RocketDR_Main(). */
+    static uint32_t sim_tick = 0u;
+    sim_tick += 5u;
+    return sim_tick;
+#else
+    return 0u;  /* default stub — all time-based logic will be gated off */
+#endif
+}
 static void     platform_delay_ms(uint32_t ms) { (void)ms; /* HAL_Delay(ms); */ }
 
 /*
@@ -78,24 +94,31 @@ static void platform_iwdg_refresh(void)
 
 /*
  * Portable critical-section helpers for Cortex-M4.
- * On M4, reading/writing a single aligned 32-bit word is atomic at the bus
- * level, but C does not guarantee atomicity for volatile float.  Wrapping
- * the shared float accesses in a critical section is cheap (2 µs at 84 MHz)
- * and makes the contract explicit for any future port or static analyser.
+ * On ARM targets: disable all maskable interrupts (CPSID i) while the
+ * critical region executes, then restore PRIMASK.  The "memory" clobber
+ * prevents the compiler from reordering memory accesses across the barrier.
+ * Cost: ~2 µs at 84 MHz — negligible for the 4.81 ms sample period.
+ *
+ * On host/simulation builds (unit test on x86): single-threaded, no IRQs,
+ * so the stubs are correct no-ops.
  */
+#if defined(__ARM_ARCH) && (__ARM_ARCH >= 6)
 static inline uint32_t critical_enter(void)
 {
-    /* uint32_t primask;
-     * __asm volatile ("MRS %0, PRIMASK" : "=r"(primask));
-     * __disable_irq();
-     * return primask; */
-    return 0u;
+    uint32_t primask;
+    __asm volatile ("MRS %0, PRIMASK" : "=r"(primask) : : "memory");
+    __asm volatile ("CPSID i"         :                : : "memory");
+    return primask;
 }
 static inline void critical_exit(uint32_t primask)
 {
-    /* if (!primask) __enable_irq(); */
-    (void)primask;
+    __asm volatile ("MSR PRIMASK, %0" : : "r"(primask) : "memory");
 }
+#else
+/* Host / simulation build — single-threaded, no real IRQs */
+static inline uint32_t critical_enter(void) { return 0u; }
+static inline void critical_exit(uint32_t primask) { (void)primask; }
+#endif
 
 /* =========================================================================
  * Hardware abstraction wiring
@@ -155,6 +178,16 @@ static bool     apogee_charge_fired = false;
 static bool     pyro_active         = false;
 static uint32_t pyro_start_ms       = 0u;
 
+/*
+ * Calibration-time failure flag for IMU-B.
+ * Set by run_calibration() when IMU-B has insufficient valid samples.
+ * Kept separate from apg_b.imu_failed so that process_imu_b() cannot
+ * silently override a calibration failure by clearing imu_failed on a
+ * subsequent successful read — a degraded-mode decision made at boot must
+ * remain visible to the voting logic throughout the flight.
+ */
+static bool imu_b_calib_failed = false;
+
 /* =========================================================================
  * IMU reading plausibility limits
  * Maximum credible values for ±16 g / ±2000 dps sensors.
@@ -199,13 +232,23 @@ static void run_calibration(void)
     uint16_t i;
     uint16_t valid_a = 0u, valid_b = 0u;
 
-    /* Collect CALIB_SAMPLE_COUNT samples at 208 Hz (~5 s) */
-    for (i = 0; i < CALIB_SAMPLE_COUNT; i++) {
+    /* Collect CALIB_SAMPLE_COUNT samples at 208 Hz (~5 s).
+     * Simultaneously accumulate gyro pitch-axis readings for bias estimation:
+     * a typical MEMS gyro offset of ±1 °/s integrates over the 4.2 s boost
+     * phase to ~4° of pitch error, which introduces a ~0.27% velocity error
+     * (~1 m/s).  Combined with accel bias drift this can push worst-case
+     * detection delay past 100 ms.  Calibrating gyro bias here removes
+     * the systematic component. */
+    double gyro_sum_a = 0.0;
+
+    for (i = 0u; i < CALIB_SAMPLE_COUNT; i++) {
         while (!imu_a_flag) { platform_iwdg_refresh(); }
         imu_a_flag = 0u;
 
         if (LSM6DSM_Read(&lsm6dsm_hal, &d) && imu_sample_sane(&d)) {
             calib_buf_a[i] = d.a[ROCKET_ACCEL_AXIS] * ROCKET_ACCEL_SIGN;
+            gyro_sum_a    += (double)(d.g[ROCKET_PITCH_GYRO_AXIS] *
+                                      ROCKET_PITCH_GYRO_SIGN);
             valid_a++;
         } else {
             calib_buf_a[i] = GRAVITY_MS2;
@@ -214,27 +257,35 @@ static void run_calibration(void)
 
     /*
      * Require at least 90% valid samples.  Fewer implies sensor init failure
-     * or intermittent SPI — do not proceed.  We call platform_fault_handler()
-     * rather than spinning: the caller must log/LED/safe-state the system.
-     * A rocket with a dead primary IMU must not be permitted to launch.
+     * or intermittent SPI — halt and let the IWDG reset the MCU so that
+     * the system re-attempts calibration.
+     * Do NOT feed the watchdog here: platform_iwdg_refresh() in the loop
+     * above keeps it alive while waiting; once we decide to halt we want the
+     * IWDG to fire so the MCU resets automatically after IWDG_TIMEOUT_MS.
      *
-     * (The previous implementation used while(valid_a < threshold) with no
-     *  body that could change valid_a — guaranteed infinite loop on fault.)
+     * (Previous implementation spun with platform_iwdg_refresh() in the
+     *  fault loop, which would feed the watchdog indefinitely and prevent
+     *  the automatic reset/retry mechanism from ever triggering.)
      */
     if (valid_a < (CALIB_SAMPLE_COUNT * 9u / 10u)) {
         /* platform_fault_handler(FAULT_IMU_A_CALIB); */
-        while (1) { platform_iwdg_refresh(); }  /* halt — operator must power-cycle */
+        for (;;) { /* intentional halt: IWDG will reset MCU */ }
     }
 
-    DR_CalibrateBias(&dr_a, calib_buf_a, CALIB_SAMPLE_COUNT);
+    DR_CalibrateBias(&dr_a, calib_buf_a, (uint32_t)CALIB_SAMPLE_COUNT);
+    ATT_CalibrateGyroBias(&att_a, (float)(gyro_sum_a / (double)valid_a));
 
     /* Calibrate IMU-B at 100 Hz */
-    for (i = 0; i < (CALIB_SAMPLE_COUNT / 2u); i++) {
+    double gyro_sum_b = 0.0;
+
+    for (i = 0u; i < (CALIB_SAMPLE_COUNT / 2u); i++) {
         while (!imu_b_flag) { platform_iwdg_refresh(); }
         imu_b_flag = 0u;
 
         if (MPU6050_Read(&mpu6050_hal, &d) && imu_sample_sane(&d)) {
             calib_buf_b[i] = d.a[ROCKET_ACCEL_AXIS] * ROCKET_ACCEL_SIGN;
+            gyro_sum_b    += (double)(d.g[ROCKET_PITCH_GYRO_AXIS] *
+                                      ROCKET_PITCH_GYRO_SIGN);
             valid_b++;
         } else {
             calib_buf_b[i] = GRAVITY_MS2;
@@ -244,11 +295,18 @@ static void run_calibration(void)
     /* IMU-B is backup; 75% threshold acceptable */
     if (valid_b < ((CALIB_SAMPLE_COUNT / 2u) * 3u / 4u)) {
         /* platform_fault_handler(FAULT_IMU_B_CALIB); */
-        /* IMU-B failure is non-fatal: continue with A-only, mark B failed */
-        apg_b.imu_failed = true;
+        /* IMU-B failure is non-fatal: continue with A-only.
+         * Use the persistent imu_b_calib_failed flag so that
+         * process_imu_b() cannot silently override this decision
+         * when IMU-B later produces reads during flight. */
+        imu_b_calib_failed   = true;
+        apg_b.imu_failed     = true;
+    } else {
+        DR_CalibrateBias(&dr_b, calib_buf_b, (uint32_t)(CALIB_SAMPLE_COUNT / 2u));
+        if (valid_b > 0u)
+            ATT_CalibrateGyroBias(&att_b,
+                                  (float)(gyro_sum_b / (double)valid_b));
     }
-
-    DR_CalibrateBias(&dr_b, calib_buf_b, CALIB_SAMPLE_COUNT / 2u);
 }
 
 /* =========================================================================
@@ -293,6 +351,11 @@ static void process_imu_a(uint32_t now_ms)
  * ========================================================================= */
 static void process_imu_b(uint32_t now_ms)
 {
+    /* Do not attempt to use IMU-B if it failed calibration — the sensor
+     * was unreliable at boot and there is no in-flight re-calibration path. */
+    if (imu_b_calib_failed)
+        return;
+
     IMU_Data_t d;
     if (!MPU6050_Read(&mpu6050_hal, &d) || !imu_sample_sane(&d)) {
         if ((now_ms - last_imu_b_ms) > IMU_WATCHDOG_MS)
@@ -353,16 +416,27 @@ void RocketDR_Main(void)
          * is acceptable pre-launch; in flight the system restarts cleanly. */
         platform_iwdg_refresh();
 
-        /* IMU-A task (208 Hz) */
-        if (imu_a_flag) {
-            imu_a_flag = 0u;   /* clear before read — single STR, atomic on M4 */
-            process_imu_a(now_ms);
+        /* IMU-A task (208 Hz).
+         * Read and clear the flag inside a critical section: the window
+         * between the LDRB (read) and STRB (clear) is a race if the timer
+         * ISR fires between them.  The critical section collapses this window
+         * to zero, preventing a one-sample skip that would restart the C1
+         * consecutive counter and add up to 24 ms to detection latency. */
+        {
+            uint32_t ps    = critical_enter();
+            uint8_t  do_a  = imu_a_flag;
+            imu_a_flag     = 0u;
+            critical_exit(ps);
+            if (do_a) process_imu_a(now_ms);
         }
 
         /* IMU-B task (100 Hz) */
-        if (imu_b_flag) {
-            imu_b_flag = 0u;
-            process_imu_b(now_ms);
+        {
+            uint32_t ps    = critical_enter();
+            uint8_t  do_b  = imu_b_flag;
+            imu_b_flag     = 0u;
+            critical_exit(ps);
+            if (do_b) process_imu_b(now_ms);
         }
 
         /* --- Flight FSM update (use IMU-A as primary) ------------------
@@ -388,7 +462,6 @@ void RocketDR_Main(void)
             FlightPhase_t prev_phase = fsm.phase;
             FlightPhase_t phase = FSM_Update(&fsm,
                                              a_net_a,
-                                             DR_GetVelocityRaw(&dr_a),
                                              apogee_vote,
                                              now_ms);
 

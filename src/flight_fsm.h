@@ -25,7 +25,6 @@ typedef struct {
 void          FSM_Init(FSM_State_t *fsm);
 FlightPhase_t FSM_Update(FSM_State_t *fsm,
                          float a_net_ms2,   /* net vertical accel (m/s²) */
-                         float velocity,    /* vertical velocity (m/s) */
                          bool  apogee_vote, /* from dual-IMU apogee detector */
                          uint32_t now_ms);
 
