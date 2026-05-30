@@ -52,6 +52,18 @@ FlightPhase_t FSM_Update(FSM_State_t *fsm,
         } else {
             fsm->burnout_debounce_active = false;
         }
+        /*
+         * Safety timeout: if PHASE_BOOST has lasted longer than BOOST_MAX_MS
+         * the sensor data may be stale (IMU failed mid-burn with a high
+         * specific-force reading latched) or the motor has certainly burned out.
+         * Force coast entry so that the C2 absolute timer can start and
+         * apogee detection is not permanently blocked.
+         */
+        if ((now_ms - fsm->phase_entry_ms) >= BOOST_MAX_MS) {
+            fsm->phase                   = PHASE_COAST;
+            fsm->phase_entry_ms          = now_ms;
+            fsm->burnout_debounce_active  = false;
+        }
         break;
 
     /* ------------------------------------------------------------------ */

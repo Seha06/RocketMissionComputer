@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <stdbool.h>
+#include <limits.h>
 
 #include "../ekf_config.h"
 #include "../nav/dead_reckoning.c"
@@ -143,21 +144,24 @@ static int run_trial(unsigned seed, float bias, float pitch_deg)
         float a_net_est = a_body_z * cosf(pitch) - GRAVITY_MS2 - dr.x[2];
 
         FlightPhase_t prev  = fsm.phase;
-        /* Compute the vote before FSM_Update so the FSM sees the current
-         * apogee state.  apg_b.imu_failed=true → vote delegates to apg_a alone. */
+
+        /* Match production ordering: APOGEE_Update runs inside process_imu_a
+         * BEFORE APOGEE_Vote/FSM_Update in the main loop. Using prev (the
+         * phase from this iteration's start) ensures APOGEE_Update is only
+         * called during coast and measures the same latency as on hardware. */
+        if (prev == PHASE_COAST && !apogee_det) {
+            if (APOGEE_Update(&apg_a, DR_GetVelocityRaw(&dr), PHASE_COAST, t_ms)) {
+                apogee_det    = true;
+                apogee_det_ms = t_ms;
+            }
+        }
+
         bool apogee_vote = APOGEE_Vote(&apg_a, &apg_b);
         FlightPhase_t phase = FSM_Update(&fsm, a_net_est, apogee_vote, t_ms);
 
         if (prev != PHASE_COAST && phase == PHASE_COAST) {
             APOGEE_OnCoastEntry(&apg_a, t_ms);
             APOGEE_OnCoastEntry(&apg_b, t_ms);
-        }
-
-        if (phase == PHASE_COAST && !apogee_det) {
-            if (APOGEE_Update(&apg_a, DR_GetVelocityRaw(&dr), phase, t_ms)) {
-                apogee_det    = true;
-                apogee_det_ms = t_ms;
-            }
         }
 
         /* Stop simulation once well past apogee (descent confirmed) */
@@ -172,9 +176,71 @@ static int run_trial(unsigned seed, float bias, float pitch_deg)
     }
 
     if (!apogee_det || apogee_true_ms == 0)
-        return (int)0x80000000;  /* INT32_MIN: not detected */
+        return INT32_MIN;  /* not detected */
 
     return (int)((int32_t)apogee_det_ms - (int32_t)apogee_true_ms);
+}
+
+/*
+ * C3 sustained-velocity test.
+ * Verifies that holding velocity below APOGEE_VEL_SECONDARY for
+ * APOGEE_SUSTAINED_MS fires C3, and that a spike above the threshold
+ * resets the window.  Returns number of failures.
+ */
+static int test_c3_sustained(void)
+{
+    int fail = 0;
+    const uint32_t coast_start = 5000u;
+    const float    v_below     = APOGEE_VEL_SECONDARY - 0.1f;  /* −0.50 m/s */
+    const float    v_above     = APOGEE_VEL_SECONDARY + 0.1f;  /* −0.30 m/s */
+
+    /* Case 1: sustained hold should fire */
+    {
+        ApogeeDetector_t det;
+        APOGEE_Init(&det, APOGEE_N_CONSEC);
+        APOGEE_OnCoastEntry(&det, coast_start);
+
+        /* Enter sustained window at T = coast_start + COAST_MIN_MS */
+        uint32_t t0 = coast_start + APOGEE_COAST_MIN_MS;
+        /* One sample below to open window, then check just before timeout */
+        APOGEE_Update(&det, v_below, PHASE_COAST, t0);
+        uint32_t pre = t0 + APOGEE_SUSTAINED_MS - 1u;
+        if (APOGEE_Update(&det, v_below, PHASE_COAST, pre)) {
+            printf("  FAIL [C3]: fired %u ms before sustained window\n", 1u);
+            fail++;
+        }
+        /* Now at exactly sustained threshold */
+        uint32_t at = t0 + APOGEE_SUSTAINED_MS;
+        if (!APOGEE_Update(&det, v_below, PHASE_COAST, at)) {
+            printf("  FAIL [C3]: did not fire at sustained window expiry\n");
+            fail++;
+        }
+    }
+
+    /* Case 2: spike above threshold resets window */
+    {
+        ApogeeDetector_t det;
+        APOGEE_Init(&det, APOGEE_N_CONSEC);
+        APOGEE_OnCoastEntry(&det, coast_start);
+
+        uint32_t t0 = coast_start + APOGEE_COAST_MIN_MS;
+        APOGEE_Update(&det, v_below, PHASE_COAST, t0);          /* open window */
+        APOGEE_Update(&det, v_above, PHASE_COAST, t0 + 10u);    /* spike: reset */
+        /* After reset, must hold for another full SUSTAINED_MS */
+        uint32_t t1 = t0 + 20u;
+        APOGEE_Update(&det, v_below, PHASE_COAST, t1);           /* reopen */
+        uint32_t pre2 = t1 + APOGEE_SUSTAINED_MS - 1u;
+        if (APOGEE_Update(&det, v_below, PHASE_COAST, pre2)) {
+            printf("  FAIL [C3]: fired before new sustained window after spike\n");
+            fail++;
+        }
+        if (!APOGEE_Update(&det, v_below, PHASE_COAST, t1 + APOGEE_SUSTAINED_MS)) {
+            printf("  FAIL [C3]: did not fire after new sustained window\n");
+            fail++;
+        }
+    }
+
+    return fail;
 }
 
 /*
@@ -256,7 +322,7 @@ int main(void)
      * ------------------------------------------------------------------ */
     int d_single = run_trial(42u, 0.12f, 0.0f);
     printf("Single trial (seed=42, bias=0.12): detection delay = %d ms\n\n", d_single);
-    if (d_single == (int)0x80000000) { printf("FAIL: apogee not detected\n"); return 1; }
+    if (d_single == INT32_MIN) { printf("FAIL: apogee not detected\n"); return 1; }
     if (d_single < -100 || d_single > 100) {
         printf("FAIL: delay %d ms outside [-100, +100] ms window\n", d_single);
         return 1;
@@ -275,7 +341,7 @@ int main(void)
         float bias = -0.39f + 0.78f * ((float)i / 999.0f);
         int d = run_trial((unsigned)i + 5000u, bias, 0.0f);
 
-        if (d == (int)0x80000000) { n_nodet++; fail++; continue; }
+        if (d == INT32_MIN) { n_nodet++; fail++; continue; }
         if (d < min_d) min_d = d;
         if (d > max_d) max_d = d;
         if (d < 0) n_early++;
@@ -341,6 +407,19 @@ int main(void)
     }
 
     /* ------------------------------------------------------------------
+     * C3 Sustained-Velocity Tests
+     * ------------------------------------------------------------------ */
+    printf("\n=== C3 Sustained-Velocity Tests ===\n");
+    {
+        int c3_fail = test_c3_sustained();
+        if (c3_fail > 0) {
+            printf("FAIL: C3 sustained-velocity test failed (%d error(s))\n", c3_fail);
+            return 1;
+        }
+        printf("PASS: C3 sustained-velocity criterion fires correctly\n");
+    }
+
+    /* ------------------------------------------------------------------
      * Pitch Deviation Tests: 0°, 5°, 10°, 15°
      * ------------------------------------------------------------------ */
     printf("\n=== Pitch Deviation Tests ===\n");
@@ -352,11 +431,11 @@ int main(void)
             int p_pass = 0, p_fail = 0, p_min = 9999, p_max = -9999;
 
             for (int ti = 0; ti < 50; ti++) {
-                unsigned seed = (unsigned)(ti * 0x9e3779b9u) ^ (unsigned)(ai * 0x517CC1B7u);
+                unsigned seed = ((unsigned)ti * 0x9e3779b9u) ^ ((unsigned)ai * 0x517CC1B7u);
                 float    bias = -0.20f + 0.40f * ((float)ti / 49.0f);
                 int d = run_trial(seed, bias, pitch_angles[ai]);
 
-                if (d == (int)0x80000000) { p_fail++; continue; }
+                if (d == INT32_MIN) { p_fail++; continue; }
                 if (d < p_min) p_min = d;
                 if (d > p_max) p_max = d;
                 if (d >= -20 && d <= 100) p_pass++; else p_fail++;

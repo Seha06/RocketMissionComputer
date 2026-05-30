@@ -244,8 +244,17 @@ static void run_calibration(void)
     double gyro_sum_a = 0.0;
 
     for (i = 0u; i < CALIB_SAMPLE_COUNT; i++) {
-        while (!imu_a_flag) { platform_iwdg_refresh(); }
-        imu_a_flag = 0u;
+        /* Atomic read-clear of the ISR-set flag, matching the main-loop pattern.
+         * Without the critical section, a timer ISR firing between the while-exit
+         * and the store could silently absorb the second pulse. */
+        for (;;) {
+            uint32_t ps = critical_enter();
+            uint8_t  f  = imu_a_flag;
+            imu_a_flag  = 0u;
+            critical_exit(ps);
+            if (f) break;
+            platform_iwdg_refresh();
+        }
 
         if (LSM6DSM_Read(&lsm6dsm_hal, &d) && imu_sample_sane(&d)) {
             /* Pack valid samples to the front of the buffer so that
@@ -285,8 +294,14 @@ static void run_calibration(void)
     double gyro_sum_b = 0.0;
 
     for (i = 0u; i < (CALIB_SAMPLE_COUNT / 2u); i++) {
-        while (!imu_b_flag) { platform_iwdg_refresh(); }
-        imu_b_flag = 0u;
+        for (;;) {
+            uint32_t ps = critical_enter();
+            uint8_t  f  = imu_b_flag;
+            imu_b_flag  = 0u;
+            critical_exit(ps);
+            if (f) break;
+            platform_iwdg_refresh();
+        }
 
         if (MPU6050_Read(&mpu6050_hal, &d) && imu_sample_sane(&d)) {
             calib_buf_b[valid_b] = d.a[ROCKET_ACCEL_AXIS] * ROCKET_ACCEL_SIGN;
@@ -417,6 +432,14 @@ void RocketDR_Main(void)
     /* --- Calibration on pad (rocket must be static) -------------------- */
     run_calibration();
 
+    /* Anchor watchdog timestamps to post-calibration time.
+     * Both timestamps are zero-initialised; calibration takes ~9.8 s.
+     * Without this, the very first failed IMU read in the main loop would
+     * satisfy (now_ms - 0) > IMU_WATCHDOG_MS and permanently latch
+     * imu_failed = true before any real watchdog violation has occurred. */
+    last_imu_a_ms = platform_tick_ms();
+    last_imu_b_ms = last_imu_a_ms;
+
     /* --- Main loop ----------------------------------------------------- */
     while (1)
     {
@@ -451,23 +474,35 @@ void RocketDR_Main(void)
             if (do_b) process_imu_b(now_ms);
         }
 
-        /* --- Flight FSM update (use IMU-A as primary) ------------------
+        /* --- Flight FSM update — IMU-A primary, IMU-B fallback ------------
          *
-         * last_a_vert_a is written by process_imu_a() in this same loop
-         * iteration (or the previous one).  We read it here — after the
-         * IMU tasks — so it always reflects the most recent sample.
-         *
-         * Previously this block used a_vert = 0.0f, which meant the FSM
-         * permanently saw a_net ≈ −g and never left PHASE_PAD_STATIC.
-         * The rocket would never detect launch and the pyro would never
-         * fire.
+         * When IMU-A is healthy, use its specific-force reading and DR state.
+         * When IMU-A has failed (sticky flag), fall back to IMU-B so that
+         * boost/burnout detection is not lost if the primary SPI bus glitches.
+         * When both fail, assume free-fall (specific force = 0); the
+         * BOOST_MAX_MS timeout in flight_fsm.c then forces the COAST
+         * transition so the C2 safety timer can start.
          */
         {
-            uint32_t ps  = critical_enter();
-        float a_vert = last_a_vert_a;
-        critical_exit(ps);
-            float pitch  = ATT_GetPitchRad(&att_a);
-            float a_net_a = a_vert * cosf(pitch) - GRAVITY_MS2 - dr_a.x[2];
+            float a_vert, pitch, bias;
+            if (!apg_a.imu_failed) {
+                uint32_t ps = critical_enter();
+                a_vert      = last_a_vert_a;
+                critical_exit(ps);
+                pitch = ATT_GetPitchRad(&att_a);
+                bias  = dr_a.x[2];
+            } else if (!apg_b.imu_failed) {
+                uint32_t ps = critical_enter();
+                a_vert      = last_a_vert_b;
+                critical_exit(ps);
+                pitch = ATT_GetPitchRad(&att_b);
+                bias  = dr_b.x[2];
+            } else {
+                a_vert = 0.0f;   /* both failed: assume free-fall */
+                pitch  = 0.0f;
+                bias   = dr_a.x[2];
+            }
+            float a_net_a = a_vert * cosf(pitch) - GRAVITY_MS2 - bias;
 
             bool apogee_vote = APOGEE_Vote(&apg_a, &apg_b);
 

@@ -47,13 +47,14 @@ bool LSM6DSM_Init(const LSM6DSM_HAL_t *hal)
 
     /*
      * CTRL1_XL: ODR=208 Hz (bits[7:4]=0101), FS=±16g (bits[3:2]=11),
-     *           anti-aliasing=100 Hz (bits[1:0]=01).
+     *           anti-aliasing=100 Hz (bits[1:0]=10).
      *
-     * Nyquist for 208 Hz ODR is 104 Hz. The original 400 Hz AA bandwidth
-     * allowed motor vibration (200-400 Hz) to alias back into the signal
-     * band. 100 Hz keeps us below Nyquist with 4 Hz of margin.
+     * 0x5E = 0b0101_1110: BW_XL[1:0]=10 → 100 Hz AA bandwidth (BW0_XL=0 default).
+     * Nyquist for 208 Hz ODR is 104 Hz. 100 Hz keeps us below Nyquist.
+     * Previous value 0x5D (BW_XL=01) set AA to 200 Hz — above Nyquist, allowing
+     * motor vibration at 104-200 Hz to alias back into the signal band.
      */
-    reg_write(hal, LSM6DSM_REG_CTRL1_XL, 0x5Du);
+    reg_write(hal, LSM6DSM_REG_CTRL1_XL, 0x5Eu);
 
     /*
      * CTRL2_G:  ODR=208 Hz (bits[7:4]=0101), FS=±2000 dps (bits[3:2]=11)
@@ -66,10 +67,16 @@ bool LSM6DSM_Init(const LSM6DSM_HAL_t *hal)
     reg_write(hal, LSM6DSM_REG_CTRL3_C, 0x44u);
 
     /*
-     * CTRL8_XL: composite LPF2 enabled, cutoff ODR/4 ≈ 52 Hz
-     * Filters motor vibration (typically 50-300 Hz) before velocity integration.
+     * CTRL8_XL: 0x88 = 0b1000_1000
+     *   bit 7 (LPF2_XL_EN)      = 1 → second-stage LPF2 enabled on accel output
+     *   bit 3 (INPUT_COMPOSITE)  = 1 → LPF2 input = ODR/4 composite filter ≈ 52 Hz
+     *   all other bits           = 0 → HP/slope disabled, no extra modes
+     *
+     * Previous value 0x09 = 0b0000_1001 had LPF2_XL_EN=0 (LPF2 disabled) and
+     * INPUT_COMPOSITE=1 (irrelevant without LPF2), meaning the accelerometer
+     * output bypassed the intended 52 Hz anti-vibration filter entirely.
      */
-    reg_write(hal, LSM6DSM_REG_CTRL8_XL, 0x09u);
+    reg_write(hal, LSM6DSM_REG_CTRL8_XL, 0x88u);
 
     return true;
 }

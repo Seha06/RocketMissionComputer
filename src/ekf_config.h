@@ -88,6 +88,11 @@
 #define LAUNCH_DEBOUNCE_MS      20U
 #define BURNOUT_ACCEL_THRESH    5.0f    /* 0.5g net: motor out */
 #define BURNOUT_DEBOUNCE_MS     80U     /* longer debounce to ignore motor chuff */
+#define BOOST_MAX_MS            7000U   /* M2020 burn is 4.2 s; 7 s is absolute max.
+                                         * If PHASE_BOOST lasts longer than this, the
+                                         * sensor reading is stale or the motor has
+                                         * certainly burned out — force coast entry so
+                                         * the C2 coast timer can start. */
 
 /* IMU watchdog: consider failed if silent for this long */
 #define IMU_WATCHDOG_MS         50U
