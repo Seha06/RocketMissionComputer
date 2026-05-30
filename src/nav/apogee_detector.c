@@ -2,7 +2,7 @@
 #include "ekf_config.h"
 #include <string.h>
 
-void APOGEE_Init(ApogeeDetector_t *det)
+void APOGEE_Init(ApogeeDetector_t *det, int8_t n_consec)
 {
     /*
      * Explicit field initialisation instead of memset().
@@ -13,12 +13,13 @@ void APOGEE_Init(ApogeeDetector_t *det)
      * practice, but it is formally UB.  Assigning each field directly is
      * unambiguous.
      */
-    det->consec_count      = 0;
-    det->apogee_fired      = false;
-    det->imu_failed        = false;
-    det->coast_start_ms    = 0u;
+    det->n_consec           = n_consec;
+    det->consec_count       = 0;
+    det->apogee_fired       = false;
+    det->imu_failed         = false;
+    det->coast_start_ms     = 0u;
     det->sustained_entry_ms = 0u;
-    det->sustained_active  = false;
+    det->sustained_active   = false;
 }
 
 void APOGEE_OnCoastEntry(ApogeeDetector_t *det, uint32_t now_ms)
@@ -61,7 +62,7 @@ bool APOGEE_Update(ApogeeDetector_t *det,
          */
         if (det->consec_count > 0) det->consec_count--;
     }
-    bool c1 = (det->consec_count >= APOGEE_N_CONSEC);
+    bool c1 = (det->consec_count >= det->n_consec);
 
     /* ----- C2: absolute safety timer ------------------------------------- */
     bool c2 = (coast_elapsed >= APOGEE_COAST_MAX_MS);
@@ -110,4 +111,17 @@ bool APOGEE_Vote(const ApogeeDetector_t *det_a,
      * Without this the rocket would never deploy even though C2 expired.
      */
     return (det_a->apogee_fired || det_b->apogee_fired);
+}
+
+void APOGEE_TickC2(ApogeeDetector_t *det, uint32_t now_ms)
+{
+    if (det->apogee_fired)
+        return;
+
+    uint32_t coast_elapsed = now_ms - det->coast_start_ms;
+    if (coast_elapsed < APOGEE_COAST_MIN_MS)
+        return;
+
+    if (coast_elapsed >= APOGEE_COAST_MAX_MS)
+        det->apogee_fired = true;
 }

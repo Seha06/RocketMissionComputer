@@ -41,12 +41,17 @@ void ATT_Update(Attitude_t *att,
     if (accel_mag < HIGH_G_SUPPRESS_THRESH && accel_mag > 0.5f * GRAVITY_MS2
         && a[ROCKET_ACCEL_AXIS] > 0.0f) {
         /*
-         * Tilt from accelerometer: atan2(ax, az) gives pitch from vertical
-         * when rocket is near-vertical and not under thrust.
-         * ax = longitudinal axis index is ROCKET_ACCEL_AXIS (2 = Z),
-         * so the perpendicular axis is X (index 0).
+         * 3-D tilt from gravity: cone angle between the rocket axis and
+         * the gravity vector, computed from the axial and lateral components.
+         * Using the total lateral magnitude (not a single perpendicular axis)
+         * captures tilt in both X-Z and Y-Z planes, so a Y-axis lean does
+         * not go undetected.  ROCKET_ACCEL_AXIS selects the axial channel
+         * without hardcoding an index.
          */
-        float pitch_accel = atan2f(a[0], a[2]);
+        float a_axial   = a[ROCKET_ACCEL_AXIS];
+        float a_sq_sum  = a[0]*a[0] + a[1]*a[1] + a[2]*a[2];
+        float a_lateral = sqrtf(fmaxf(0.0f, a_sq_sum - a_axial*a_axial));
+        float pitch_accel = atan2f(a_lateral, a_axial);
         att->pitch_rad = COMP_ALPHA_GYRO * pitch_gyro +
                          COMP_ALPHA_ACCEL * pitch_accel;
     } else {

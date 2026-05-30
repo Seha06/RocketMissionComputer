@@ -31,6 +31,7 @@
  */
 typedef struct {
     int8_t   consec_count;        /* C1: consecutive sub-threshold sample count */
+    int8_t   n_consec;            /* C1: threshold — set per-IMU to match its ODR */
     /*
      * apogee_fired is written by APOGEE_Update() (called from an ISR-triggered
      * processing function) and read by APOGEE_Vote() in the main loop.
@@ -41,13 +42,18 @@ typedef struct {
      * delayed read, which adds at most 4.81 ms to detection latency.
      */
     volatile bool apogee_fired;   /* latched true once apogee is declared */
-    bool     imu_failed;          /* watchdog: set when IMU silent > IMU_WATCHDOG_MS */
+    bool     imu_failed;          /* sticky: set when IMU silent > IMU_WATCHDOG_MS;
+                                   * never cleared — once failed, always degraded mode */
     uint32_t coast_start_ms;      /* timestamp when COAST phase entered */
     uint32_t sustained_entry_ms;  /* C3: timestamp when sustained-drop window opened */
     bool     sustained_active;    /* C3: velocity has been below secondary threshold */
 } ApogeeDetector_t;
 
-void APOGEE_Init(ApogeeDetector_t *det);
+/*
+ * n_consec: C1 confirmation count sized for the IMU's sample rate.
+ * Use APOGEE_N_CONSEC for IMU-A (208 Hz) and APOGEE_N_CONSEC_B for IMU-B (100 Hz).
+ */
+void APOGEE_Init(ApogeeDetector_t *det, int8_t n_consec);
 
 /* Call when the flight FSM transitions into PHASE_COAST. */
 void APOGEE_OnCoastEntry(ApogeeDetector_t *det, uint32_t now_ms);
@@ -75,5 +81,12 @@ bool APOGEE_Update(ApogeeDetector_t *det,
  */
 bool APOGEE_Vote(const ApogeeDetector_t *det_a,
                  const ApogeeDetector_t *det_b);
+
+/*
+ * C2-only tick — advance the absolute coast timer without touching the
+ * C1/C3 state.  Call from the main loop when both IMUs are failed so that
+ * the C2 safety backstop fires even if APOGEE_Update is never called.
+ */
+void APOGEE_TickC2(ApogeeDetector_t *det, uint32_t now_ms);
 
 #endif /* APOGEE_DETECTOR_H */

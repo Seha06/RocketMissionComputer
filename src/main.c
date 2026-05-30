@@ -146,9 +146,11 @@ static Attitude_t        att_a, att_b;
 static DR_State_t        dr_a,  dr_b;
 static ApogeeDetector_t  apg_a, apg_b;
 
-/* Calibration sample buffers */
+/* Calibration sample buffers.
+ * IMU-A collects CALIB_SAMPLE_COUNT samples; IMU-B collects half as many
+ * (100 Hz rate over the same wall-clock window). */
 static float calib_buf_a[CALIB_SAMPLE_COUNT];
-static float calib_buf_b[CALIB_SAMPLE_COUNT];
+static float calib_buf_b[CALIB_SAMPLE_COUNT / 2u];
 
 /*
  * Last vertical acceleration from each IMU — written by process_imu_x(),
@@ -246,13 +248,17 @@ static void run_calibration(void)
         imu_a_flag = 0u;
 
         if (LSM6DSM_Read(&lsm6dsm_hal, &d) && imu_sample_sane(&d)) {
-            calib_buf_a[i] = d.a[ROCKET_ACCEL_AXIS] * ROCKET_ACCEL_SIGN;
-            gyro_sum_a    += (double)(d.g[ROCKET_PITCH_GYRO_AXIS] *
-                                      ROCKET_PITCH_GYRO_SIGN);
+            /* Pack valid samples to the front of the buffer so that
+             * DR_CalibrateBias(... valid_a) averages only real readings.
+             * Substituting GRAVITY_MS2 for failed samples would dilute the
+             * bias estimate toward zero, leaving a residual proportional to
+             * the failure rate × true bias. */
+            calib_buf_a[valid_a] = d.a[ROCKET_ACCEL_AXIS] * ROCKET_ACCEL_SIGN;
+            gyro_sum_a          += (double)(d.g[ROCKET_PITCH_GYRO_AXIS] *
+                                            ROCKET_PITCH_GYRO_SIGN);
             valid_a++;
-        } else {
-            calib_buf_a[i] = GRAVITY_MS2;
         }
+        /* failed sample: skip — do not write a substitute value */
     }
 
     /*
@@ -272,7 +278,7 @@ static void run_calibration(void)
         for (;;) { /* intentional halt: IWDG will reset MCU */ }
     }
 
-    DR_CalibrateBias(&dr_a, calib_buf_a, (uint32_t)CALIB_SAMPLE_COUNT);
+    DR_CalibrateBias(&dr_a, calib_buf_a, valid_a);
     ATT_CalibrateGyroBias(&att_a, (float)(gyro_sum_a / (double)valid_a));
 
     /* Calibrate IMU-B at 100 Hz */
@@ -283,12 +289,10 @@ static void run_calibration(void)
         imu_b_flag = 0u;
 
         if (MPU6050_Read(&mpu6050_hal, &d) && imu_sample_sane(&d)) {
-            calib_buf_b[i] = d.a[ROCKET_ACCEL_AXIS] * ROCKET_ACCEL_SIGN;
-            gyro_sum_b    += (double)(d.g[ROCKET_PITCH_GYRO_AXIS] *
-                                      ROCKET_PITCH_GYRO_SIGN);
+            calib_buf_b[valid_b] = d.a[ROCKET_ACCEL_AXIS] * ROCKET_ACCEL_SIGN;
+            gyro_sum_b          += (double)(d.g[ROCKET_PITCH_GYRO_AXIS] *
+                                            ROCKET_PITCH_GYRO_SIGN);
             valid_b++;
-        } else {
-            calib_buf_b[i] = GRAVITY_MS2;
         }
     }
 
@@ -302,7 +306,7 @@ static void run_calibration(void)
         imu_b_calib_failed   = true;
         apg_b.imu_failed     = true;
     } else {
-        DR_CalibrateBias(&dr_b, calib_buf_b, (uint32_t)(CALIB_SAMPLE_COUNT / 2u));
+        DR_CalibrateBias(&dr_b, calib_buf_b, valid_b);
         if (valid_b > 0u)
             ATT_CalibrateGyroBias(&att_b,
                                   (float)(gyro_sum_b / (double)valid_b));
@@ -321,8 +325,10 @@ static void process_imu_a(uint32_t now_ms)
         return;
     }
 
-    last_imu_a_ms    = now_ms;
-    apg_a.imu_failed = false;
+    last_imu_a_ms = now_ms;
+    /* imu_failed is a sticky latch — never cleared after first failure.
+     * An IMU that demonstrated it can go silent cannot be trusted back into
+     * full voting; the vote degrades to single-IMU or both-failed mode. */
 
     float a_vert     = d.a[ROCKET_ACCEL_AXIS]        * ROCKET_ACCEL_SIGN;
     float gyro_pitch = d.g[ROCKET_PITCH_GYRO_AXIS]   * ROCKET_PITCH_GYRO_SIGN;
@@ -363,8 +369,8 @@ static void process_imu_b(uint32_t now_ms)
         return;
     }
 
-    last_imu_b_ms    = now_ms;
-    apg_b.imu_failed = false;
+    last_imu_b_ms = now_ms;
+    /* imu_failed is sticky — see process_imu_a comment */
 
     float a_vert     = d.a[ROCKET_ACCEL_AXIS]        * ROCKET_ACCEL_SIGN;
     float gyro_pitch = d.g[ROCKET_PITCH_GYRO_AXIS]   * ROCKET_PITCH_GYRO_SIGN;
@@ -395,12 +401,18 @@ void RocketDR_Main(void)
     ATT_Init(&att_b);
     DR_Init(&dr_a, IMU_A_DT_S);
     DR_Init(&dr_b, IMU_B_DT_S);
-    APOGEE_Init(&apg_a);
-    APOGEE_Init(&apg_b);
+    APOGEE_Init(&apg_a, APOGEE_N_CONSEC);    /* 208 Hz: 5 × 4.81 ms = 24 ms */
+    APOGEE_Init(&apg_b, APOGEE_N_CONSEC_B); /* 100 Hz: 3 × 10 ms  = 30 ms */
 
     /* --- Sensor init --------------------------------------------------- */
-    LSM6DSM_Init(&lsm6dsm_hal);
-    MPU6050_Init(&mpu6050_hal);
+    if (!LSM6DSM_Init(&lsm6dsm_hal)) {
+        /* platform_fault_handler(FAULT_LSM6DSM_INIT); */
+        for (;;) { /* Primary IMU init failure — IWDG will reset MCU */ }
+    }
+    /* MPU6050 is backup; failure here is non-fatal.
+     * If init returns false, MPU6050_Read will also fail, triggering the
+     * 75% threshold halt in run_calibration() which sets imu_b_calib_failed. */
+    (void)MPU6050_Init(&mpu6050_hal);
 
     /* --- Calibration on pad (rocket must be static) -------------------- */
     run_calibration();
@@ -470,6 +482,17 @@ void RocketDR_Main(void)
                 APOGEE_OnCoastEntry(&apg_a, now_ms);
                 APOGEE_OnCoastEntry(&apg_b, now_ms);
             }
+        }
+
+        /* --- Dual-IMU failure C2 backstop ---------------------------------
+         * When both IMUs are failed, process_imu_a/b return early without
+         * calling APOGEE_Update, so the C2 absolute-safety timer never
+         * advances and the pyro would never fire.  Tick C2 directly here
+         * using a dedicated function that does NOT touch C1/C3 state — this
+         * avoids interfering with those criteria if an IMU later recovers. */
+        if (fsm.phase == PHASE_COAST && apg_a.imu_failed && apg_b.imu_failed) {
+            APOGEE_TickC2(&apg_a, now_ms);
+            APOGEE_TickC2(&apg_b, now_ms);
         }
 
         /* --- Non-blocking pyro pulse management ------------------------

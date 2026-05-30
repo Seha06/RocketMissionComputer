@@ -67,7 +67,10 @@
  *       so a free-fall criterion cannot distinguish apogee from general coast.
  * ----------------------------------------------------------------------- */
 #define APOGEE_VEL_THRESHOLD    -0.25f  /* C1 primary threshold (m/s) */
-#define APOGEE_N_CONSEC         ((int8_t)5) /* C1: 5 × 4.81 ms = 24 ms confirmation */
+#define APOGEE_N_CONSEC         ((int8_t)5) /* IMU-A C1: 5 × 4.81 ms = 24 ms confirmation */
+#define APOGEE_N_CONSEC_B       ((int8_t)3) /* IMU-B C1: 3 × 10 ms  = 30 ms confirmation
+                                             * Lower count compensates for B's 100 Hz rate so
+                                             * both paths meet the 100 ms detection budget. */
 #define APOGEE_VEL_SECONDARY    -0.40f  /* C3 sustained threshold (m/s) */
 #define APOGEE_SUSTAINED_MS     50U     /* C3: must hold 50 ms continuously */
 #define VELOCITY_LPF_ALPHA      0.3f    /* LPF coefficient — telemetry only */

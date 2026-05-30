@@ -137,11 +137,19 @@ void DR_Predict(DR_State_t *dr,
     mat3_mul(F, dr->P, FP);
     mat3_mul_bt(FP, F, FPFt);
 
-    /* Scale Q by dt to get per-step noise */
+    /*
+     * Per-step process noise:
+     *   Velocity: noise source is per-sample acceleration σ_a (m/s²).
+     *             Each step contributes σ_a×dt to velocity; variance = σ_a²×dt².
+     *   Bias:     random-walk specified per step (m/s²); variance = σ_b² directly.
+     *
+     * Q[1][1] stores σ_a², Q[2][2] stores σ_b² (set in DR_Init).
+     * dt2 was computed above for the F matrix.
+     */
     float Qdt[3][3] = {
-        { 0.0f,           0.0f,                     0.0f                     },
-        { 0.0f, dr->Q[1][1]*dt, 0.0f                     },
-        { 0.0f, 0.0f,           dr->Q[2][2]*dt }
+        { 0.0f,                  0.0f,             0.0f           },
+        { 0.0f, dr->Q[1][1]*dt2, 0.0f             },
+        { 0.0f, 0.0f,            dr->Q[2][2]      }
     };
 
     mat3_add(FPFt, Qdt, dr->P);

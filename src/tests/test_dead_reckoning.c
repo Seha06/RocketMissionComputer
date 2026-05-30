@@ -78,12 +78,14 @@ static int run_trial(unsigned seed, float bias, float pitch_deg)
     const float sin_p = sinf(pitch_deg * DEG_TO_RAD);
 
     DR_State_t       dr;
-    ApogeeDetector_t apg;
+    ApogeeDetector_t apg_a, apg_b;
     FSM_State_t      fsm;
     Attitude_t       att;
 
     DR_Init(&dr, dt);
-    APOGEE_Init(&apg);
+    APOGEE_Init(&apg_a, APOGEE_N_CONSEC);    /* 208 Hz: 5 samples */
+    APOGEE_Init(&apg_b, APOGEE_N_CONSEC_B);  /* IMU-B absent in test: mark failed */
+    apg_b.imu_failed = true;
     FSM_Init(&fsm);
     ATT_Init(&att);
 
@@ -141,13 +143,18 @@ static int run_trial(unsigned seed, float bias, float pitch_deg)
         float a_net_est = a_body_z * cosf(pitch) - GRAVITY_MS2 - dr.x[2];
 
         FlightPhase_t prev  = fsm.phase;
-        FlightPhase_t phase = FSM_Update(&fsm, a_net_est, false, t_ms);
+        /* Compute the vote before FSM_Update so the FSM sees the current
+         * apogee state.  apg_b.imu_failed=true → vote delegates to apg_a alone. */
+        bool apogee_vote = APOGEE_Vote(&apg_a, &apg_b);
+        FlightPhase_t phase = FSM_Update(&fsm, a_net_est, apogee_vote, t_ms);
 
-        if (prev != PHASE_COAST && phase == PHASE_COAST)
-            APOGEE_OnCoastEntry(&apg, t_ms);
+        if (prev != PHASE_COAST && phase == PHASE_COAST) {
+            APOGEE_OnCoastEntry(&apg_a, t_ms);
+            APOGEE_OnCoastEntry(&apg_b, t_ms);
+        }
 
         if (phase == PHASE_COAST && !apogee_det) {
-            if (APOGEE_Update(&apg, DR_GetVelocityRaw(&dr), phase, t_ms)) {
+            if (APOGEE_Update(&apg_a, DR_GetVelocityRaw(&dr), phase, t_ms)) {
                 apogee_det    = true;
                 apogee_det_ms = t_ms;
             }
@@ -185,7 +192,7 @@ static int test_c2_timer(void)
     /* Should fire after COAST_MAX */
     {
         ApogeeDetector_t det;
-        APOGEE_Init(&det);
+        APOGEE_Init(&det, APOGEE_N_CONSEC);
         APOGEE_OnCoastEntry(&det, coast_start);
 
         uint32_t t   = coast_start + APOGEE_COAST_MIN_MS;
@@ -203,7 +210,7 @@ static int test_c2_timer(void)
     /* Should NOT fire one step before COAST_MAX */
     {
         ApogeeDetector_t det;
-        APOGEE_Init(&det);
+        APOGEE_Init(&det, APOGEE_N_CONSEC);
         APOGEE_OnCoastEntry(&det, coast_start);
 
         uint32_t pre_c2 = coast_start + APOGEE_COAST_MAX_MS - step_ms;
