@@ -4,7 +4,21 @@
 
 void APOGEE_Init(ApogeeDetector_t *det)
 {
-    memset(det, 0, sizeof(*det));
+    /*
+     * Explicit field initialisation instead of memset().
+     * memset() writes through a void* pointer and does not carry volatile
+     * semantics — the C standard does not guarantee that writes to a
+     * volatile-qualified field via memset() are visible to other execution
+     * contexts (C11 §7.22.6.1).  On most ARM+GCC targets this works in
+     * practice, but it is formally UB.  Assigning each field directly is
+     * unambiguous.
+     */
+    det->consec_count      = 0;
+    det->apogee_fired      = false;
+    det->imu_failed        = false;
+    det->coast_start_ms    = 0u;
+    det->sustained_entry_ms = 0u;
+    det->sustained_active  = false;
 }
 
 void APOGEE_OnCoastEntry(ApogeeDetector_t *det, uint32_t now_ms)

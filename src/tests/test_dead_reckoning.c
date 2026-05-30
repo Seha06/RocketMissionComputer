@@ -74,8 +74,8 @@ static int run_trial(unsigned seed, float bias, float pitch_deg)
 
     const float dt    = IMU_A_DT_S;
     const float NOISE = 0.05f;   /* LSM6DSM noise density at 208 Hz */
-    const float cos_p = cosf(pitch_deg * 0.017453293f);
-    const float sin_p = sinf(pitch_deg * 0.017453293f);
+    const float cos_p = cosf(pitch_deg * DEG_TO_RAD);
+    const float sin_p = sinf(pitch_deg * DEG_TO_RAD);
 
     DR_State_t       dr;
     ApogeeDetector_t apg;
