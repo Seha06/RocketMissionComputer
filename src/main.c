@@ -229,8 +229,8 @@ void RocketDR_TimerB_ISR(void)   /* 100 Hz */
 static void run_calibration(void)
 {
     IMU_Data_t d;
-    uint16_t i;
-    uint16_t valid_a = 0u, valid_b = 0u;
+    uint32_t i;
+    uint32_t valid_a = 0u, valid_b = 0u;
 
     /* Collect CALIB_SAMPLE_COUNT samples at 208 Hz (~5 s).
      * Simultaneously accumulate gyro pitch-axis readings for bias estimation:
