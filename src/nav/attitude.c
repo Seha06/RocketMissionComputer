@@ -26,7 +26,15 @@ void ATT_Update(Attitude_t *att,
     /* Gyro integration (always active) */
     float pitch_gyro = att->pitch_rad + (gyro_pitch - att->gyro_bias_rad_s) * dt;
 
-    if (accel_mag < HIGH_G_SUPPRESS_THRESH && accel_mag > 0.5f * GRAVITY_MS2) {
+    /*
+     * Require a[ROCKET_ACCEL_AXIS] > 0: during coast the longitudinal axis
+     * reads negative specific force (aerodynamic drag opposing upward motion).
+     * atan2(ax, negative_az) = ~π which would flip pitch 180° — wrong.
+     * The accel correction is only valid when the main axis sees +g (upright,
+     * low-G flight near pad or slow manoeuvre).
+     */
+    if (accel_mag < HIGH_G_SUPPRESS_THRESH && accel_mag > 0.5f * GRAVITY_MS2
+        && a[ROCKET_ACCEL_AXIS] > 0.0f) {
         /*
          * Tilt from accelerometer: atan2(ax, az) gives pitch from vertical
          * when rocket is near-vertical and not under thrust.

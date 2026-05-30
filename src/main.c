@@ -189,7 +189,7 @@ static void process_imu_a(uint32_t now_ms)
     float a_net = a_vert * cosf(pitch) - GRAVITY_MS2 - dr_a.x[2];
 
     if (fsm.phase == PHASE_COAST)
-        APOGEE_Update(&apg_a, vel, a_net, fsm.phase, now_ms);
+        APOGEE_Update(&apg_a, vel, fsm.phase, now_ms);
 }
 
 /* =========================================================================
@@ -221,7 +221,7 @@ static void process_imu_b(uint32_t now_ms)
     float a_net = a_vert * cosf(pitch) - GRAVITY_MS2 - dr_b.x[2];
 
     if (fsm.phase == PHASE_COAST)
-        APOGEE_Update(&apg_b, vel, a_net, fsm.phase, now_ms);
+        APOGEE_Update(&apg_b, vel, fsm.phase, now_ms);
 }
 
 /* =========================================================================
