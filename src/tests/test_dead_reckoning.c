@@ -123,8 +123,12 @@ static int run_trial(unsigned seed, float bias)
         true_alt += true_v * dt;
         if (true_alt > peak_alt) peak_alt = true_alt;
 
-        /* True apogee: first sample where velocity ≤ 0 */
-        if (true_v <= 0.0f && apogee_true_ms == 0)
+        /* True apogee: first sample where velocity ≤ 0.
+         * step > 0 guard: at step=0 true_v is still 0.0f before motor
+         * fires (it is set after the integration below) — without this guard
+         * apogee_true_ms would be set to 0 at t=0, making every detection
+         * delay look like it happened exactly at t=0ms. */
+        if (step > 0 && true_v <= 0.0f && apogee_true_ms == 0u)
             apogee_true_ms = t_ms;
 
         /* Simulated accelerometer reading: specific force + bias + noise */
@@ -162,7 +166,12 @@ static int run_trial(unsigned seed, float bias)
         if (apogee_det && (t_ms - apogee_det_ms) > 2000u)
             break;
 
-        t_ms += (uint32_t)(dt * 1000.0f);
+        /* Accumulate t_ms without truncation error.
+         * (uint32_t)(dt*1000) = 4 ms but true step is 4.807 ms.
+         * Over 22 s (4576 steps) this under-counts by 3.7 s, making
+         * C2 timer validation in the test meaningless.
+         * Derive from step count to stay exact. */
+        t_ms = (uint32_t)((float)(step + 1) * 1000.0f / IMU_A_ODR_HZ + 0.5f);
     }
 
     if (!apogee_det || apogee_true_ms == 0)
@@ -217,16 +226,24 @@ int main(void)
 
     /* ------------------------------------------------------------------
      * Monte Carlo: 1000 trials
-     * Bias range: ±0.2 m/s² around 0.1 m/s² (realistic LSM6DSM offset)
+     *
+     * Bias range: ±0.39 m/s² (LSM6DSM datasheet typical worst-case ±40 mg).
+     * Previous range [0, +0.2] m/s² tested only positive bias and covered
+     * less than half of the sensor's specified range.  Negative bias causes
+     * DR velocity to read *more negative* than true, potentially triggering
+     * apogee early; this must be validated.
      * ------------------------------------------------------------------ */
     printf("Running 1000 Monte Carlo trials...\n");
+    printf("  Bias range: [%.3f, +%.3f] m/s² (LSM6DSM ±40 mg spec)\n",
+           -0.39f, 0.39f);
 
     int pass = 0, fail = 0;
     int min_d = 9999, max_d = -9999;
     int n_early = 0, n_nodet = 0;
 
     for (int i = 0; i < 1000; i++) {
-        float bias = 0.1f + 0.2f * ((float)(i % 11) / 11.0f - 0.5f);
+        /* Sweep full ±0.39 m/s² bias range uniformly */
+        float bias = -0.39f + 0.78f * ((float)i / 999.0f);
         int d = run_trial((unsigned)i + 5000u, bias);
 
         if (d == (int)0x80000000) {
@@ -259,5 +276,81 @@ int main(void)
     }
 
     printf("\nPASS: 100%% detection within 100 ms window\n");
+
+    /* ------------------------------------------------------------------
+     * Dual-IMU Voting Unit Tests
+     * APOGEE_Vote() had 0% coverage in the Monte Carlo above.
+     * Test all four branches: both-healthy, A-only, B-only, both-failed.
+     * ------------------------------------------------------------------ */
+    printf("\n=== Dual-IMU Voting Tests ===\n");
+    int vote_pass = 0, vote_fail = 0;
+
+    /* Helper macro */
+    #define VOTE_CHECK(label, da, db, expected) do {                        \
+        bool got = APOGEE_Vote(&(da), &(db));                               \
+        if (got == (expected)) {                                            \
+            vote_pass++;                                                    \
+        } else {                                                            \
+            printf("  FAIL [%s]: expected %d got %d\n", label,             \
+                   (int)(expected), (int)got);                              \
+            vote_fail++;                                                    \
+        }                                                                   \
+    } while (0)
+
+    /* 1. Both healthy, both fired → deploy */
+    {
+        ApogeeDetector_t a = {0}, b = {0};
+        a.apogee_fired = true; a.imu_failed = false;
+        b.apogee_fired = true; b.imu_failed = false;
+        VOTE_CHECK("both-healthy both-fired", a, b, true);
+    }
+    /* 2. Both healthy, only A fired → no deploy (AND logic) */
+    {
+        ApogeeDetector_t a = {0}, b = {0};
+        a.apogee_fired = true;  a.imu_failed = false;
+        b.apogee_fired = false; b.imu_failed = false;
+        VOTE_CHECK("both-healthy A-only", a, b, false);
+    }
+    /* 3. A healthy+fired, B failed → A decides, deploy */
+    {
+        ApogeeDetector_t a = {0}, b = {0};
+        a.apogee_fired = true; a.imu_failed = false;
+        b.apogee_fired = false; b.imu_failed = true;
+        VOTE_CHECK("A-healthy-fired B-failed", a, b, true);
+    }
+    /* 4. A failed, B healthy+fired → B decides, deploy */
+    {
+        ApogeeDetector_t a = {0}, b = {0};
+        a.apogee_fired = false; a.imu_failed = true;
+        b.apogee_fired = true;  b.imu_failed = false;
+        VOTE_CHECK("A-failed B-healthy-fired", a, b, true);
+    }
+    /* 5. Both failed, neither C2 fired → no deploy */
+    {
+        ApogeeDetector_t a = {0}, b = {0};
+        a.imu_failed = true; b.imu_failed = true;
+        VOTE_CHECK("both-failed none-fired", a, b, false);
+    }
+    /* 6. Both failed, C2 fired in A → deploy (safety backstop) */
+    {
+        ApogeeDetector_t a = {0}, b = {0};
+        a.apogee_fired = true; a.imu_failed = true;
+        b.imu_failed = true;
+        VOTE_CHECK("both-failed C2-in-A", a, b, true);
+    }
+    /* 7. A healthy not-fired, B healthy fired → no deploy (AND) */
+    {
+        ApogeeDetector_t a = {0}, b = {0};
+        a.apogee_fired = false; a.imu_failed = false;
+        b.apogee_fired = true;  b.imu_failed = false;
+        VOTE_CHECK("both-healthy B-only", a, b, false);
+    }
+
+    printf("  Voting tests: %d PASS / %d FAIL\n", vote_pass, vote_fail);
+    if (vote_fail > 0) {
+        printf("FAIL: dual-IMU voting logic error\n");
+        return 1;
+    }
+    printf("PASS: dual-IMU voting all correct\n");
     return 0;
 }

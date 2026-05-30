@@ -17,8 +17,8 @@
 #define LSM6DSM_WHO_AM_I_VAL    0x6A
 
 /* Sensitivity: ±16 g, ±2000 dps */
-#define LSM6DSM_ACCEL_SENS      (0.000488f * 9.80665f) /* LSB → m/s² */
-#define LSM6DSM_GYRO_SENS       (0.070f * 0.017453f)   /* LSB → rad/s */
+#define LSM6DSM_ACCEL_SENS      (0.000488f * 9.80665f)  /* LSB → m/s², ±16g range */
+#define LSM6DSM_GYRO_SENS       (0.070f * 0.017453293f) /* LSB → rad/s, ±2000 dps */
 
 typedef struct {
     float a[3];              /* m/s², body frame [x,y,z] */

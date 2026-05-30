@@ -19,6 +19,7 @@
 
 /* Physical constants */
 #define GRAVITY_MS2             9.80665f
+#define DEG_TO_RAD              0.017453293f   /* π/180 — shared, 7 significant figures */
 
 /* -----------------------------------------------------------------------
  * Target mission profile: M2020 motor on 18 kg rocket, ~3000 m apogee
@@ -66,7 +67,7 @@
  *       so a free-fall criterion cannot distinguish apogee from general coast.
  * ----------------------------------------------------------------------- */
 #define APOGEE_VEL_THRESHOLD    -0.25f  /* C1 primary threshold (m/s) */
-#define APOGEE_N_CONSEC         5       /* C1: 5 × 4.81 ms = 24 ms confirmation */
+#define APOGEE_N_CONSEC         ((int8_t)5) /* C1: 5 × 4.81 ms = 24 ms confirmation */
 #define APOGEE_VEL_SECONDARY    -0.40f  /* C3 sustained threshold (m/s) */
 #define APOGEE_SUSTAINED_MS     50U     /* C3: must hold 50 ms continuously */
 #define VELOCITY_LPF_ALPHA      0.3f    /* LPF coefficient — telemetry only */
@@ -87,5 +88,10 @@
 
 /* IMU watchdog: consider failed if silent for this long */
 #define IMU_WATCHDOG_MS         50U
+
+/* FSM: time to wait in PHASE_APOGEE before transitioning to PHASE_DESCEND.
+ * Distinct from PYRO_PULSE_MS in main.c — one controls ejection charge
+ * duration, the other controls FSM state dwell time. */
+#define APOGEE_DESCEND_DELAY_MS 500U
 
 #endif /* EKF_CONFIG_H */

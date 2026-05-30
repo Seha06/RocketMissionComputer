@@ -23,8 +23,13 @@
 #define MPU6050_WHO_AM_I_VAL    0x68u
 
 /* Sensitivity: ±16 g, ±2000 dps */
-#define MPU6050_ACCEL_SENS      (1.0f / 2048.0f * 9.80665f) /* LSB → m/s² */
-#define MPU6050_GYRO_SENS       (1.0f / 16.4f * 0.017453f)  /* LSB → rad/s */
+#define MPU6050_ACCEL_SENS      (1.0f / 2048.0f * 9.80665f)  /* LSB → m/s², ±16g range */
+#define MPU6050_GYRO_SENS       (1.0f / 16.4f * 0.017453293f) /* LSB → rad/s, ±2000 dps */
+
+/* WHO_AM_I happens to equal the I2C address for MPU-6050; keep them linked
+ * so an accidental edit to one doesn't silently break the other. */
+#undef  MPU6050_WHO_AM_I_VAL
+#define MPU6050_WHO_AM_I_VAL    MPU6050_ADDR
 
 typedef struct {
     void     (*i2c_write)(uint8_t addr, uint8_t reg,

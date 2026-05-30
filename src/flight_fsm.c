@@ -65,8 +65,8 @@ FlightPhase_t FSM_Update(FSM_State_t *fsm,
 
     /* ------------------------------------------------------------------ */
     case PHASE_APOGEE:
-        /* Transition to DESCEND automatically after ejection delay */
-        if ((now_ms - fsm->phase_entry_ms) >= 500u) {
+        /* Transition to DESCEND after ejection dwell period */
+        if ((now_ms - fsm->phase_entry_ms) >= APOGEE_DESCEND_DELAY_MS) {
             fsm->phase          = PHASE_DESCEND;
             fsm->phase_entry_ms = now_ms;
         }

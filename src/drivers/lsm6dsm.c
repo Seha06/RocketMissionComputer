@@ -23,9 +23,12 @@ static uint8_t reg_read(const LSM6DSM_HAL_t *hal, uint8_t reg)
 static void burst_read(const LSM6DSM_HAL_t *hal, uint8_t reg,
                        uint8_t *buf, uint8_t len)
 {
-    /* 1 command byte + len data bytes */
-    uint8_t tx[13] = { (uint8_t)(reg | 0x80u) };
-    uint8_t rx[13];
+    /* 1 command byte + len data bytes.
+     * All of tx[] must be initialised: spi_exchange clocks out MOSI for
+     * every byte, and reading uninitialised stack memory is UB (MISRA 9.1). */
+    uint8_t tx[13] = {0};
+    uint8_t rx[13] = {0};
+    tx[0] = (uint8_t)(reg | 0x80u);
     if (len > 12u) len = 12u;
     hal->cs_assert();
     hal->spi_exchange(tx, rx, (uint16_t)(len + 1u));

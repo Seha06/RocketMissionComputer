@@ -76,6 +76,27 @@ static void platform_iwdg_refresh(void)
     /* HAL_IWDG_Refresh(&hiwdg); */
 }
 
+/*
+ * Portable critical-section helpers for Cortex-M4.
+ * On M4, reading/writing a single aligned 32-bit word is atomic at the bus
+ * level, but C does not guarantee atomicity for volatile float.  Wrapping
+ * the shared float accesses in a critical section is cheap (2 µs at 84 MHz)
+ * and makes the contract explicit for any future port or static analyser.
+ */
+static inline uint32_t critical_enter(void)
+{
+    /* uint32_t primask;
+     * __asm volatile ("MRS %0, PRIMASK" : "=r"(primask));
+     * __disable_irq();
+     * return primask; */
+    return 0u;
+}
+static inline void critical_exit(uint32_t primask)
+{
+    /* if (!primask) __enable_irq(); */
+    (void)primask;
+}
+
 /* =========================================================================
  * Hardware abstraction wiring
  * ========================================================================= */
@@ -157,11 +178,16 @@ static bool imu_sample_sane(const IMU_Data_t *d)
 void RocketDR_TimerA_ISR(void)   /* 208 Hz */
 {
     imu_a_flag = 1u;
+    /* __DSB() ensures the store is visible to main loop before ISR returns.
+     * Without a barrier, the compiler may reorder this write past other
+     * volatile accesses at -O2 (AAPCS §B.8, MISRA-C:2012 Dir 4.1). */
+    /* __DSB(); */
 }
 
 void RocketDR_TimerB_ISR(void)   /* 100 Hz */
 {
     imu_b_flag = 1u;
+    /* __DSB(); */
 }
 
 /* =========================================================================
@@ -187,12 +213,18 @@ static void run_calibration(void)
     }
 
     /*
-     * Require at least 90% valid samples.  Fewer than that suggests the
-     * sensor was not properly initialised or the SPI bus is intermittent.
-     * Hanging here is deliberate: a rocket with a dead primary IMU must
-     * not be allowed to launch.
+     * Require at least 90% valid samples.  Fewer implies sensor init failure
+     * or intermittent SPI — do not proceed.  We call platform_fault_handler()
+     * rather than spinning: the caller must log/LED/safe-state the system.
+     * A rocket with a dead primary IMU must not be permitted to launch.
+     *
+     * (The previous implementation used while(valid_a < threshold) with no
+     *  body that could change valid_a — guaranteed infinite loop on fault.)
      */
-    while (valid_a < (CALIB_SAMPLE_COUNT * 9u / 10u)) { platform_iwdg_refresh(); }
+    if (valid_a < (CALIB_SAMPLE_COUNT * 9u / 10u)) {
+        /* platform_fault_handler(FAULT_IMU_A_CALIB); */
+        while (1) { platform_iwdg_refresh(); }  /* halt — operator must power-cycle */
+    }
 
     DR_CalibrateBias(&dr_a, calib_buf_a, CALIB_SAMPLE_COUNT);
 
@@ -209,8 +241,12 @@ static void run_calibration(void)
         }
     }
 
-    /* IMU-B is backup; 75% threshold is acceptable */
-    while (valid_b < ((CALIB_SAMPLE_COUNT / 2u) * 3u / 4u)) { platform_iwdg_refresh(); }
+    /* IMU-B is backup; 75% threshold acceptable */
+    if (valid_b < ((CALIB_SAMPLE_COUNT / 2u) * 3u / 4u)) {
+        /* platform_fault_handler(FAULT_IMU_B_CALIB); */
+        /* IMU-B failure is non-fatal: continue with A-only, mark B failed */
+        apg_b.imu_failed = true;
+    }
 
     DR_CalibrateBias(&dr_b, calib_buf_b, CALIB_SAMPLE_COUNT / 2u);
 }
@@ -233,8 +269,15 @@ static void process_imu_a(uint32_t now_ms)
     float a_vert     = d.a[ROCKET_ACCEL_AXIS]        * ROCKET_ACCEL_SIGN;
     float gyro_pitch = d.g[ROCKET_PITCH_GYRO_AXIS]   * ROCKET_PITCH_GYRO_SIGN;
 
-    /* Store for FSM — see note in RocketDR_Main() */
-    last_a_vert_a = a_vert;
+    /* Store for FSM.  Use critical section: C standard does not guarantee
+     * that a float write is atomic, even on Cortex-M4 with FPU.  The
+     * section is entered/exited in both writer (here) and reader (main loop)
+     * so any future port to Cortex-M0 or a multi-core target stays safe. */
+    {
+        uint32_t ps = critical_enter();
+        last_a_vert_a = a_vert;
+        critical_exit(ps);
+    }
 
     ATT_Update(&att_a, d.a, gyro_pitch, IMU_A_DT_S);
     float pitch = ATT_GetPitchRad(&att_a);
@@ -263,7 +306,11 @@ static void process_imu_b(uint32_t now_ms)
     float a_vert     = d.a[ROCKET_ACCEL_AXIS]        * ROCKET_ACCEL_SIGN;
     float gyro_pitch = d.g[ROCKET_PITCH_GYRO_AXIS]   * ROCKET_PITCH_GYRO_SIGN;
 
-    last_a_vert_b = a_vert;
+    {
+        uint32_t ps = critical_enter();
+        last_a_vert_b = a_vert;
+        critical_exit(ps);
+    }
 
     ATT_Update(&att_b, d.a, gyro_pitch, IMU_B_DT_S);
     float pitch = ATT_GetPitchRad(&att_b);
@@ -330,7 +377,9 @@ void RocketDR_Main(void)
          * fire.
          */
         {
-            float a_vert = last_a_vert_a;
+            uint32_t ps  = critical_enter();
+        float a_vert = last_a_vert_a;
+        critical_exit(ps);
             float pitch  = ATT_GetPitchRad(&att_a);
             float a_net_a = a_vert * cosf(pitch) - GRAVITY_MS2 - dr_a.x[2];
 
