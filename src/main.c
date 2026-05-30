@@ -4,12 +4,12 @@
  * Target: STM32F401RCT6 @ 84 MHz, ARM Cortex-M4 FPU
  *
  * Execution model:
- *   - TIM2 fires at 208 Hz (LSM6DSM ODR) → timer_isr() sets imu_a_flag
+ *   - TIM2 fires at 208 Hz (LSM6DSM ODR) → RocketDR_TimerA_ISR() sets imu_a_flag
  *   - TIM3 fires at 100 Hz (MPU-6050 ODR) → sets imu_b_flag
  *   - main() polls flags and runs the detection pipeline
  *
  * This file uses platform stubs (marked PLATFORM_*) that the integrator
- * must implement for the specific STM32 HAL / RTOS configuration.
+ * must replace with real STM32 HAL calls.
  */
 
 #include <stdint.h>
@@ -52,15 +52,28 @@ static void platform_i2c_read(uint8_t addr, uint8_t reg,
     (void)addr; (void)reg; (void)data; (void)len;
 }
 
-static uint32_t platform_tick_ms(void)   { return 0; /* HAL_GetTick(); */ }
+static uint32_t platform_tick_ms(void)        { return 0; /* HAL_GetTick(); */ }
 static void     platform_delay_ms(uint32_t ms) { (void)ms; /* HAL_Delay(ms); */ }
 
-/* Pyro channel fire: drive GPIO high for 500 ms */
-static void platform_fire_apogee_charge(void)
+/*
+ * Non-blocking pyro pin control.
+ * The integrator maps these to GPIO set/clear — no HAL_Delay inside.
+ * The 500 ms pulse width is managed by the main loop timer below.
+ */
+static void platform_pyro_pin_set(bool active)
 {
-    /* HAL_GPIO_WritePin(PYRO1_GPIO, PYRO1_PIN, GPIO_PIN_SET);  */
-    /* HAL_Delay(500);                                            */
-    /* HAL_GPIO_WritePin(PYRO1_GPIO, PYRO1_PIN, GPIO_PIN_RESET); */
+    if (active) {
+        /* HAL_GPIO_WritePin(PYRO1_GPIO, PYRO1_PIN, GPIO_PIN_SET);   */
+    } else {
+        /* HAL_GPIO_WritePin(PYRO1_GPIO, PYRO1_PIN, GPIO_PIN_RESET); */
+    }
+    (void)active;
+}
+
+/* Feed the Independent Watchdog. Call at least every IWDG_TIMEOUT_MS. */
+static void platform_iwdg_refresh(void)
+{
+    /* HAL_IWDG_Refresh(&hiwdg); */
 }
 
 /* =========================================================================
@@ -93,28 +106,62 @@ static ApogeeDetector_t  apg_a, apg_b;
 static float calib_buf_a[CALIB_SAMPLE_COUNT];
 static float calib_buf_b[CALIB_SAMPLE_COUNT];
 
-/* IMU-ready flags set by timer ISR */
-static volatile bool imu_a_flag = false;
-static volatile bool imu_b_flag = false;
+/*
+ * Last vertical acceleration from each IMU — written by process_imu_x(),
+ * read by the FSM block in the main loop.  Declared volatile because both
+ * the ISR-triggered processing function and the main-loop FSM block access
+ * them in separate passes through the loop.
+ */
+static volatile float last_a_vert_a = 0.0f;
+static volatile float last_a_vert_b = 0.0f;
+
+/*
+ * IMU-ready flags set by timer ISR.
+ * Declared volatile uint8_t (not bool) so that the clear in the main loop
+ * compiles to a single STR instruction on Cortex-M4, making it atomic
+ * with respect to the ISR's single-instruction set.
+ */
+static volatile uint8_t imu_a_flag = 0u;
+static volatile uint8_t imu_b_flag = 0u;
 
 /* Watchdog timestamps */
-static uint32_t last_imu_a_ms = 0;
-static uint32_t last_imu_b_ms = 0;
+static uint32_t last_imu_a_ms = 0u;
+static uint32_t last_imu_b_ms = 0u;
 
-/* Apogee fired flag (edge-triggered to call pyro only once) */
-static bool apogee_charge_fired = false;
+/* Pyro pulse: non-blocking 500 ms drive */
+#define PYRO_PULSE_MS       500u
+static bool     apogee_charge_fired = false;
+static bool     pyro_active         = false;
+static uint32_t pyro_start_ms       = 0u;
+
+/* =========================================================================
+ * IMU reading plausibility limits
+ * Maximum credible values for ±16 g / ±2000 dps sensors.
+ * A sample outside these ranges indicates a sensor fault or SEU.
+ * ========================================================================= */
+#define IMU_ACCEL_MAX_MS2   (18.0f * GRAVITY_MS2)   /* 18 g */
+#define IMU_GYRO_MAX_RPS    (2100.0f * 0.017453f)    /* 2100 dps in rad/s */
+
+static bool imu_sample_sane(const IMU_Data_t *d)
+{
+    for (int i = 0; i < 3; i++) {
+        if (d->a[i] >  IMU_ACCEL_MAX_MS2 || d->a[i] < -IMU_ACCEL_MAX_MS2) return false;
+        if (d->g[i] >  IMU_GYRO_MAX_RPS  || d->g[i] < -IMU_GYRO_MAX_RPS)  return false;
+    }
+    return true;
+}
 
 /* =========================================================================
  * Timer ISR callbacks — call from TIM2 and TIM3 interrupt handlers
  * ========================================================================= */
 void RocketDR_TimerA_ISR(void)   /* 208 Hz */
 {
-    imu_a_flag = true;
+    imu_a_flag = 1u;
 }
 
 void RocketDR_TimerB_ISR(void)   /* 100 Hz */
 {
-    imu_b_flag = true;
+    imu_b_flag = 1u;
 }
 
 /* =========================================================================
@@ -124,39 +171,48 @@ static void run_calibration(void)
 {
     IMU_Data_t d;
     uint16_t i;
+    uint16_t valid_a = 0u, valid_b = 0u;
 
-    /* Collect CALIB_SAMPLE_COUNT samples at ~208 Hz (~1 second) */
+    /* Collect CALIB_SAMPLE_COUNT samples at 208 Hz (~5 s) */
     for (i = 0; i < CALIB_SAMPLE_COUNT; i++) {
-        /* Wait for next IMU-A sample */
-        while (!imu_a_flag) {}
-        imu_a_flag = false;
+        while (!imu_a_flag) { platform_iwdg_refresh(); }
+        imu_a_flag = 0u;
 
-        LSM6DSM_Read(&lsm6dsm_hal, &d);
-        if (d.valid) {
-            float *a = &d.ax;
-            calib_buf_a[i] = a[ROCKET_ACCEL_AXIS] * ROCKET_ACCEL_SIGN;
+        if (LSM6DSM_Read(&lsm6dsm_hal, &d) && imu_sample_sane(&d)) {
+            calib_buf_a[i] = d.a[ROCKET_ACCEL_AXIS] * ROCKET_ACCEL_SIGN;
+            valid_a++;
         } else {
-            calib_buf_a[i] = GRAVITY_MS2;  /* fallback if read fails */
+            calib_buf_a[i] = GRAVITY_MS2;
         }
     }
 
+    /*
+     * Require at least 90% valid samples.  Fewer than that suggests the
+     * sensor was not properly initialised or the SPI bus is intermittent.
+     * Hanging here is deliberate: a rocket with a dead primary IMU must
+     * not be allowed to launch.
+     */
+    while (valid_a < (CALIB_SAMPLE_COUNT * 9u / 10u)) { platform_iwdg_refresh(); }
+
     DR_CalibrateBias(&dr_a, calib_buf_a, CALIB_SAMPLE_COUNT);
 
-    /* Calibrate IMU-B using MPU-6050 at its 100 Hz rate */
-    for (i = 0; i < (CALIB_SAMPLE_COUNT / 2); i++) {
-        while (!imu_b_flag) {}
-        imu_b_flag = false;
+    /* Calibrate IMU-B at 100 Hz */
+    for (i = 0; i < (CALIB_SAMPLE_COUNT / 2u); i++) {
+        while (!imu_b_flag) { platform_iwdg_refresh(); }
+        imu_b_flag = 0u;
 
-        MPU6050_Read(&mpu6050_hal, &d);
-        if (d.valid) {
-            float *a = &d.ax;
-            calib_buf_b[i] = a[ROCKET_ACCEL_AXIS] * ROCKET_ACCEL_SIGN;
+        if (MPU6050_Read(&mpu6050_hal, &d) && imu_sample_sane(&d)) {
+            calib_buf_b[i] = d.a[ROCKET_ACCEL_AXIS] * ROCKET_ACCEL_SIGN;
+            valid_b++;
         } else {
             calib_buf_b[i] = GRAVITY_MS2;
         }
     }
 
-    DR_CalibrateBias(&dr_b, calib_buf_b, CALIB_SAMPLE_COUNT / 2);
+    /* IMU-B is backup; 75% threshold is acceptable */
+    while (valid_b < ((CALIB_SAMPLE_COUNT / 2u) * 3u / 4u)) { platform_iwdg_refresh(); }
+
+    DR_CalibrateBias(&dr_b, calib_buf_b, CALIB_SAMPLE_COUNT / 2u);
 }
 
 /* =========================================================================
@@ -165,8 +221,7 @@ static void run_calibration(void)
 static void process_imu_a(uint32_t now_ms)
 {
     IMU_Data_t d;
-    if (!LSM6DSM_Read(&lsm6dsm_hal, &d)) {
-        /* Check watchdog */
+    if (!LSM6DSM_Read(&lsm6dsm_hal, &d) || !imu_sample_sane(&d)) {
         if ((now_ms - last_imu_a_ms) > IMU_WATCHDOG_MS)
             apg_a.imu_failed = true;
         return;
@@ -175,21 +230,19 @@ static void process_imu_a(uint32_t now_ms)
     last_imu_a_ms    = now_ms;
     apg_a.imu_failed = false;
 
-    float *a = &d.ax;
-    float a_vert   = a[ROCKET_ACCEL_AXIS]           * ROCKET_ACCEL_SIGN;
-    float *g       = &d.gx;
-    float gyro_pitch = g[ROCKET_PITCH_GYRO_AXIS]    * ROCKET_PITCH_GYRO_SIGN;
+    float a_vert     = d.a[ROCKET_ACCEL_AXIS]        * ROCKET_ACCEL_SIGN;
+    float gyro_pitch = d.g[ROCKET_PITCH_GYRO_AXIS]   * ROCKET_PITCH_GYRO_SIGN;
 
-    ATT_Update(&att_a, &d.ax, gyro_pitch, IMU_A_DT_S);
+    /* Store for FSM — see note in RocketDR_Main() */
+    last_a_vert_a = a_vert;
+
+    ATT_Update(&att_a, d.a, gyro_pitch, IMU_A_DT_S);
     float pitch = ATT_GetPitchRad(&att_a);
 
     DR_Predict(&dr_a, a_vert, pitch, IMU_A_DT_S);
 
-    float vel  = DR_GetVelocity(&dr_a);
-    float a_net = a_vert * cosf(pitch) - GRAVITY_MS2 - dr_a.x[2];
-
     if (fsm.phase == PHASE_COAST)
-        APOGEE_Update(&apg_a, vel, fsm.phase, now_ms);
+        APOGEE_Update(&apg_a, DR_GetVelocityRaw(&dr_a), fsm.phase, now_ms);
 }
 
 /* =========================================================================
@@ -198,7 +251,7 @@ static void process_imu_a(uint32_t now_ms)
 static void process_imu_b(uint32_t now_ms)
 {
     IMU_Data_t d;
-    if (!MPU6050_Read(&mpu6050_hal, &d)) {
+    if (!MPU6050_Read(&mpu6050_hal, &d) || !imu_sample_sane(&d)) {
         if ((now_ms - last_imu_b_ms) > IMU_WATCHDOG_MS)
             apg_b.imu_failed = true;
         return;
@@ -207,21 +260,18 @@ static void process_imu_b(uint32_t now_ms)
     last_imu_b_ms    = now_ms;
     apg_b.imu_failed = false;
 
-    float *a = &d.ax;
-    float a_vert     = a[ROCKET_ACCEL_AXIS]         * ROCKET_ACCEL_SIGN;
-    float *g         = &d.gx;
-    float gyro_pitch = g[ROCKET_PITCH_GYRO_AXIS]    * ROCKET_PITCH_GYRO_SIGN;
+    float a_vert     = d.a[ROCKET_ACCEL_AXIS]        * ROCKET_ACCEL_SIGN;
+    float gyro_pitch = d.g[ROCKET_PITCH_GYRO_AXIS]   * ROCKET_PITCH_GYRO_SIGN;
 
-    ATT_Update(&att_b, &d.ax, gyro_pitch, IMU_B_DT_S);
+    last_a_vert_b = a_vert;
+
+    ATT_Update(&att_b, d.a, gyro_pitch, IMU_B_DT_S);
     float pitch = ATT_GetPitchRad(&att_b);
 
     DR_Predict(&dr_b, a_vert, pitch, IMU_B_DT_S);
 
-    float vel   = DR_GetVelocity(&dr_b);
-    float a_net = a_vert * cosf(pitch) - GRAVITY_MS2 - dr_b.x[2];
-
     if (fsm.phase == PHASE_COAST)
-        APOGEE_Update(&apg_b, vel, fsm.phase, now_ms);
+        APOGEE_Update(&apg_b, DR_GetVelocityRaw(&dr_b), fsm.phase, now_ms);
 }
 
 /* =========================================================================
@@ -250,45 +300,74 @@ void RocketDR_Main(void)
     {
         uint32_t now_ms = platform_tick_ms();
 
+        /* Feed hardware watchdog — must happen every loop iteration.
+         * If this stops (e.g. stuck in an ISR or infinite loop), the IWDG
+         * will reset the MCU.  After reset the rocket re-calibrates, which
+         * is acceptable pre-launch; in flight the system restarts cleanly. */
+        platform_iwdg_refresh();
+
         /* IMU-A task (208 Hz) */
         if (imu_a_flag) {
-            imu_a_flag = false;
+            imu_a_flag = 0u;   /* clear before read — single STR, atomic on M4 */
             process_imu_a(now_ms);
         }
 
         /* IMU-B task (100 Hz) */
         if (imu_b_flag) {
-            imu_b_flag = false;
+            imu_b_flag = 0u;
             process_imu_b(now_ms);
         }
 
-        /* --- Flight FSM update (use IMU-A as primary) ------------------ */
-        float a_net_a = 0.0f;
+        /* --- Flight FSM update (use IMU-A as primary) ------------------
+         *
+         * last_a_vert_a is written by process_imu_a() in this same loop
+         * iteration (or the previous one).  We read it here — after the
+         * IMU tasks — so it always reflects the most recent sample.
+         *
+         * Previously this block used a_vert = 0.0f, which meant the FSM
+         * permanently saw a_net ≈ −g and never left PHASE_PAD_STATIC.
+         * The rocket would never detect launch and the pyro would never
+         * fire.
+         */
         {
-            float a_vert = 0.0f; /* would come from last IMU-A read */
+            float a_vert = last_a_vert_a;
             float pitch  = ATT_GetPitchRad(&att_a);
-            a_net_a = a_vert * cosf(pitch) - GRAVITY_MS2 - dr_a.x[2];
+            float a_net_a = a_vert * cosf(pitch) - GRAVITY_MS2 - dr_a.x[2];
+
+            bool apogee_vote = APOGEE_Vote(&apg_a, &apg_b);
+
+            FlightPhase_t prev_phase = fsm.phase;
+            FlightPhase_t phase = FSM_Update(&fsm,
+                                             a_net_a,
+                                             DR_GetVelocityRaw(&dr_a),
+                                             apogee_vote,
+                                             now_ms);
+
+            /* Notify apogee detectors on BOOST → COAST transition */
+            if (prev_phase != PHASE_COAST && phase == PHASE_COAST) {
+                APOGEE_OnCoastEntry(&apg_a, now_ms);
+                APOGEE_OnCoastEntry(&apg_b, now_ms);
+            }
         }
 
-        bool apogee_vote = APOGEE_Vote(&apg_a, &apg_b);
-
-        FlightPhase_t prev_phase = fsm.phase;
-        FlightPhase_t phase = FSM_Update(&fsm,
-                                         a_net_a,
-                                         DR_GetVelocity(&dr_a),
-                                         apogee_vote,
-                                         now_ms);
-
-        /* Notify apogee detectors when COAST is entered */
-        if (prev_phase != PHASE_COAST && phase == PHASE_COAST) {
-            APOGEE_OnCoastEntry(&apg_a, now_ms);
-            APOGEE_OnCoastEntry(&apg_b, now_ms);
-        }
-
-        /* --- Fire apogee charge (single shot) -------------------------- */
-        if (phase == PHASE_APOGEE && !apogee_charge_fired) {
+        /* --- Non-blocking pyro pulse management ------------------------
+         *
+         * Firing is split into "start" and "stop" edges so that the main
+         * loop is never stalled.  The original implementation called
+         * HAL_Delay(500) inside platform_fire_apogee_charge(), blocking
+         * all IMU processing, watchdog feeds, and FSM updates for 500 ms
+         * immediately after apogee — the most time-critical moment.
+         */
+        if (fsm.phase == PHASE_APOGEE && !apogee_charge_fired) {
             apogee_charge_fired = true;
-            platform_fire_apogee_charge();
+            pyro_active         = true;
+            pyro_start_ms       = now_ms;
+            platform_pyro_pin_set(true);
+        }
+
+        if (pyro_active && (now_ms - pyro_start_ms) >= PYRO_PULSE_MS) {
+            pyro_active = false;
+            platform_pyro_pin_set(false);
         }
     }
 }

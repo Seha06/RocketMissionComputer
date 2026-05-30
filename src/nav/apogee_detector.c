@@ -81,5 +81,13 @@ bool APOGEE_Vote(const ApogeeDetector_t *det_a,
     if (a_ok && b_ok) return (det_a->apogee_fired && det_b->apogee_fired);
     if (a_ok)         return  det_a->apogee_fired;
     if (b_ok)         return  det_b->apogee_fired;
-    return false;
+
+    /*
+     * Both IMUs failed.  C1 and C3 are meaningless without sensor data, but
+     * C2 (the absolute coast timer) fires entirely from the system clock and
+     * does not depend on IMU health.  If either detector's C2 already fired
+     * apogee_fired, honour it — this is the last-resort safety backstop.
+     * Without this the rocket would never deploy even though C2 expired.
+     */
+    return (det_a->apogee_fired || det_b->apogee_fired);
 }

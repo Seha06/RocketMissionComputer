@@ -21,8 +21,8 @@
 #define LSM6DSM_GYRO_SENS       (0.070f * 0.017453f)   /* LSB → rad/s */
 
 typedef struct {
-    float ax, ay, az;       /* m/s², body frame */
-    float gx, gy, gz;       /* rad/s, body frame */
+    float a[3];              /* m/s², body frame [x,y,z] */
+    float g[3];              /* rad/s, body frame [x,y,z] */
     uint32_t timestamp_ms;
     bool valid;
 } IMU_Data_t;

@@ -44,9 +44,13 @@ bool LSM6DSM_Init(const LSM6DSM_HAL_t *hal)
 
     /*
      * CTRL1_XL: ODR=208 Hz (bits[7:4]=0101), FS=±16g (bits[3:2]=11),
-     *           anti-aliasing=400 Hz (bits[1:0]=00)
+     *           anti-aliasing=100 Hz (bits[1:0]=01).
+     *
+     * Nyquist for 208 Hz ODR is 104 Hz. The original 400 Hz AA bandwidth
+     * allowed motor vibration (200-400 Hz) to alias back into the signal
+     * band. 100 Hz keeps us below Nyquist with 4 Hz of margin.
      */
-    reg_write(hal, LSM6DSM_REG_CTRL1_XL, 0x5Cu);
+    reg_write(hal, LSM6DSM_REG_CTRL1_XL, 0x5Du);
 
     /*
      * CTRL2_G:  ODR=208 Hz (bits[7:4]=0101), FS=±2000 dps (bits[3:2]=11)
@@ -87,12 +91,12 @@ bool LSM6DSM_Read(const LSM6DSM_HAL_t *hal, IMU_Data_t *out)
     int16_t ay = (int16_t)((uint16_t)raw[9]  << 8 | raw[8]);
     int16_t az = (int16_t)((uint16_t)raw[11] << 8 | raw[10]);
 
-    out->gx = (float)gx * LSM6DSM_GYRO_SENS;
-    out->gy = (float)gy * LSM6DSM_GYRO_SENS;
-    out->gz = (float)gz * LSM6DSM_GYRO_SENS;
-    out->ax = (float)ax * LSM6DSM_ACCEL_SENS;
-    out->ay = (float)ay * LSM6DSM_ACCEL_SENS;
-    out->az = (float)az * LSM6DSM_ACCEL_SENS;
+    out->g[0] = (float)gx * LSM6DSM_GYRO_SENS;
+    out->g[1] = (float)gy * LSM6DSM_GYRO_SENS;
+    out->g[2] = (float)gz * LSM6DSM_GYRO_SENS;
+    out->a[0] = (float)ax * LSM6DSM_ACCEL_SENS;
+    out->a[1] = (float)ay * LSM6DSM_ACCEL_SENS;
+    out->a[2] = (float)az * LSM6DSM_ACCEL_SENS;
     out->timestamp_ms = hal->tick_ms();
     out->valid = true;
 
