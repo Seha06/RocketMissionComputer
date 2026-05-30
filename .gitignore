@@ -1,0 +1,14 @@
+# Compiled test binaries
+src/tests/test_dr
+src/tests/debug_dr
+src/tests/check_profile
+src/tests/find_drag_k
+
+# Generic build output
+*.o
+*.a
+*.elf
+*.hex
+*.bin
+*.map
+build/
