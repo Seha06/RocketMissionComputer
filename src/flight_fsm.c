@@ -1,0 +1,87 @@
+#include "flight_fsm.h"
+#include "ekf_config.h"
+#include <string.h>
+
+void FSM_Init(FSM_State_t *fsm)
+{
+    memset(fsm, 0, sizeof(*fsm));
+    fsm->phase = PHASE_PAD_STATIC;
+}
+
+FlightPhase_t FSM_Update(FSM_State_t *fsm,
+                         float a_net_ms2,
+                         float velocity,
+                         bool  apogee_vote,
+                         uint32_t now_ms)
+{
+    switch (fsm->phase) {
+
+    /* ------------------------------------------------------------------ */
+    case PHASE_PAD_STATIC:
+        if (a_net_ms2 >= LAUNCH_ACCEL_THRESH) {
+            if (!fsm->launch_debounce_active) {
+                fsm->launch_debounce_ms    = now_ms;
+                fsm->launch_debounce_active = true;
+            }
+            if ((now_ms - fsm->launch_debounce_ms) >= LAUNCH_DEBOUNCE_MS) {
+                fsm->phase           = PHASE_BOOST;
+                fsm->phase_entry_ms  = now_ms;
+                fsm->launch_debounce_active = false;
+            }
+        } else {
+            fsm->launch_debounce_active = false;
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case PHASE_BOOST:
+        /*
+         * Burnout detected when acceleration drops below threshold.
+         * Debounce prevents motor chuff (brief thrust interruptions) from
+         * triggering a false coast entry.
+         */
+        if (a_net_ms2 < BURNOUT_ACCEL_THRESH) {
+            if (!fsm->burnout_debounce_active) {
+                fsm->burnout_debounce_ms    = now_ms;
+                fsm->burnout_debounce_active = true;
+            }
+            if ((now_ms - fsm->burnout_debounce_ms) >= BURNOUT_DEBOUNCE_MS) {
+                fsm->phase           = PHASE_COAST;
+                fsm->phase_entry_ms  = now_ms;
+                fsm->burnout_debounce_active = false;
+            }
+        } else {
+            fsm->burnout_debounce_active = false;
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case PHASE_COAST:
+        if (apogee_vote) {
+            fsm->phase          = PHASE_APOGEE;
+            fsm->phase_entry_ms = now_ms;
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case PHASE_APOGEE:
+        /* Transition to DESCEND automatically after ejection delay */
+        if ((now_ms - fsm->phase_entry_ms) >= 500u) {
+            fsm->phase          = PHASE_DESCEND;
+            fsm->phase_entry_ms = now_ms;
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case PHASE_DESCEND:
+        /* Terminal state — no further transitions in this module */
+        break;
+
+    default:
+        break;
+    }
+
+    (void)velocity;  /* available for future descend-phase logic */
+
+    return fsm->phase;
+}
